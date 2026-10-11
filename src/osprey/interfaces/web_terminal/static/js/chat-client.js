@@ -280,6 +280,25 @@ export async function interrupt(chatId) {
 }
 
 /**
+ * Answer the `permission_request` a turn is waiting on. The body carries the
+ * request id, the decision and — for a question — the chosen answers keyed by
+ * question text. A 404 `no_pending_request` means the request is already gone:
+ * the turn was stopped, or another tab answered it first.
+ * @param {string} chatId
+ * @param {{ request_id: string, allow: boolean, answers?: Record<string, string>, message?: string }} body
+ * @returns {Promise<Response>}
+ */
+export async function answerPermission(chatId, body) {
+  const res = await fetch(withPrefix(`${CHAT_ENDPOINT}/${encodeURIComponent(chatId)}/permission`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw await transportError(res);
+  return res;
+}
+
+/**
  * One conversation turn as served by `GET /api/session-chat`. The same shape
  * the renderer takes, so turns pass straight from here to the replay.
  *
@@ -287,6 +306,8 @@ export async function interrupt(chatId) {
  * @property {string} role - `user` or `assistant`
  * @property {string} content - the turn's text; markdown for an agent turn
  * @property {string} [timestamp] - transcript timestamp
+ * @property {ChatEvent[]} [events] - an agent turn's stream as the live chat
+ *   received it (`text`, `thinking`, `tool_use`, `tool_result`, `result`)
  */
 
 /**
@@ -335,7 +356,8 @@ export async function requestHandoff(key, options = {}) {
  * Read the conversation behind *key* so the Simple view can replay it.
  *
  * `full=1` asks for the whole transcript rather than the trailing window the
- * session page shows. The response is `{turns, count}`; only the turns are
+ * session page shows, and `events=1` for each agent turn's thinking and tool
+ * calls alongside its text. The response is `{turns, count}`; only the turns are
  * returned, and a body without them yields an empty list — a key whose
  * transcript has no turns yet is a normal first flip, not a failure.
  * `no-store` keeps a flip from replaying a copy cached before the last turn.
@@ -343,7 +365,7 @@ export async function requestHandoff(key, options = {}) {
  * @returns {Promise<ChatTurn[]>}
  */
 export async function fetchHistory(key) {
-  const url = `${SESSION_CHAT_ENDPOINT}?session_id=${encodeURIComponent(key)}&full=1`;
+  const url = `${SESSION_CHAT_ENDPOINT}?session_id=${encodeURIComponent(key)}&full=1&events=1`;
   const res = await fetch(withPrefix(url), { cache: 'no-store' });
   if (!res.ok) throw await transportError(res);
   const data = await res.json();

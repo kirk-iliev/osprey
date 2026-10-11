@@ -3,6 +3,10 @@
 POST /api/chat?stream={true|false}
 Body: {"prompt": "...", "chat_id": "..."}
 
+POST /api/chat/{chat_id}/permission
+Body: {"request_id": "...", "allow": bool, "answers"?: {...}, "message"?: "..."}
+Answers a ``permission_request`` frame the in-flight turn is waiting on.
+
 GET /api/chat/commands
 Answers {"commands": [{"name", "description", "argument_hint", "kind"}, ...]},
 the slash commands the chat agent accepts in this project.
@@ -88,34 +92,63 @@ class ChatRequest(BaseModel):
     chat_id: str
 
 
+class PermissionAnswer(BaseModel):
+    """Body of ``POST /api/chat/{chat_id}/permission``.
+
+    ``answers`` (question text -> chosen label, several labels comma-joined)
+    answers an ``AskUserQuestion``; for a tool approval it is omitted.
+    """
+
+    request_id: str
+    allow: bool
+    answers: dict[str, str] | None = None
+    message: str | None = None
+
+
+#: Longest string value of a tool input the chat client is sent. Inputs are
+#: shown as a one-line summary and an expandable detail, never edited.
+_INPUT_VALUE_CHARS = 2000
+
+
+def _clip_input(value: Any) -> Any:
+    """Return *value* with every string inside it cut to ``_INPUT_VALUE_CHARS``."""
+    if isinstance(value, str):
+        return value if len(value) <= _INPUT_VALUE_CHARS else value[:_INPUT_VALUE_CHARS] + "…"
+    if isinstance(value, dict):
+        return {k: _clip_input(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clip_input(v) for v in value]
+    return value
+
+
 def _strip_for_chat(event: dict[str, Any]) -> dict[str, Any]:
     """Return a wire-hygiene copy of *event* for the chat API client.
 
-    The chat client renders a lightweight conversation view and never needs the
-    heavy or sensitive payloads the SDK produces. This filter drops them while
-    leaving the event's identity (``type``) and light metadata intact:
+    The chat renders tool chips, thinking traces and approval cards, so the
+    payloads those need pass through, bounded:
 
-    - ``tool_use``   drop ``input`` (arguments); keep ``tool_name`` etc.
-    - ``tool_result`` drop ``content`` (the result body); keep ``is_error`` etc.
-    - ``thinking``   drop ``content``; a bare ``{"type": "thinking"}`` marker survives.
-    - ``result``     reduce to exactly ``{"type", "is_error"}`` — cost/duration/
-                     turn counts never reach the chat client.
-    - every other type (``text``, ``system``, ``error``, ``session_reset``, …)
-      passes through unchanged.
+    - ``tool_use`` / ``permission_request``  ``input`` with long strings clipped.
+    - ``tool_result``  only the clipped ``preview`` the stream already carries.
+    - ``result``  reduce to ``{"type", "is_error", "duration_ms"}`` — cost and
+                  turn counts never reach the chat client.
+    - every other type (``text``, ``thinking``, ``system``, ``error``,
+      ``session_reset``, …) passes through unchanged.
 
     The input event is never mutated; a new dict is returned whenever a change
     applies (and the same object may be returned for pass-through types).
     """
     etype = event.get("type")
 
-    if etype == "tool_use":
-        return {k: v for k, v in event.items() if k != "input"}
+    if etype in ("tool_use", "permission_request") and "input" in event:
+        return {**event, "input": _clip_input(event["input"])}
     if etype == "tool_result":
         return {k: v for k, v in event.items() if k != "content"}
-    if etype == "thinking":
-        return {k: v for k, v in event.items() if k != "content"}
     if etype == "result":
-        return {"type": "result", "is_error": event.get("is_error")}
+        return {
+            "type": "result",
+            "is_error": event.get("is_error"),
+            "duration_ms": event.get("duration_ms"),
+        }
 
     return event
 
@@ -421,6 +454,30 @@ async def interrupt_chat(chat_id: str, request: Request) -> Response:
             await session.interrupt()
         except Exception:
             logger.debug("Interrupt signal failed for chat %s", chat_id, exc_info=True)
+    return Response(status_code=204)
+
+
+@router.post("/api/chat/{chat_id}/permission", status_code=204)
+async def answer_chat_permission(
+    chat_id: str, body: PermissionAnswer, request: Request
+) -> Response:
+    """Answer a ``permission_request`` the chat's in-flight turn is waiting on.
+
+    404 ``no_pending_request`` when nothing waits under ``request_id`` — the
+    turn was stopped, or the request was already answered from another tab.
+    """
+    registry = request.app.state.operator_registry
+    session = registry.get_chat_session(chat_id)
+    if session is None or not session.resolve_permission(
+        body.request_id, allow=body.allow, answers=body.answers, message=body.message
+    ):
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "no_pending_request",
+                "message": "No request is waiting under that id.",
+            },
+        )
     return Response(status_code=204)
 
 

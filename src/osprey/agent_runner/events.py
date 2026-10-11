@@ -48,6 +48,7 @@ class ThinkingEvent:
     """Assistant reasoning text."""
 
     text: str
+    parent_tool_use_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -176,7 +177,7 @@ def translate_message(message: object) -> list[AgentEvent]:
             if isinstance(block, TextBlock):
                 events.append(TextEvent(text=block.text, parent_tool_use_id=parent))
             elif isinstance(block, ThinkingBlock):
-                events.append(ThinkingEvent(text=block.thinking))
+                events.append(ThinkingEvent(text=block.thinking, parent_tool_use_id=parent))
             else:
                 tool_event = _tool_block_event(block, parent)
                 if tool_event is not None:

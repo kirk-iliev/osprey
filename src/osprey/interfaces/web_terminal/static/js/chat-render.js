@@ -2,12 +2,13 @@
 /**
  * OSPREY Web Terminal — Simple-mode operator chat: message-list renderer.
  *
- * View-model + DOM builders for the operator chat log (the `op-*` console
- * styled in operator.css). A {@link createChatRenderer} instance owns the
- * message-list state a single stream of SSE-style events would otherwise
- * scatter across the controller: the accumulating agent-text buffer, the
- * transient activity line, and the first-turn bookkeeping that decides
- * whether a `session_reset` is worth a divider.
+ * View-model for the operator chat log (the `op-*` console styled in
+ * operator.css). A {@link createChatRenderer} instance owns the message-list
+ * state a single stream of SSE-style events would otherwise scatter across the
+ * controller: the agent turn being written (its text, thinking, tool calls,
+ * plan and cards), the live loader, and the first-turn bookkeeping that decides
+ * whether a `session_reset` is worth a divider. The blocks are built in
+ * chat-blocks.js.
  *
  * Trust boundary: chat renders *model* output — including verbatim tool
  * results from outside the trust boundary — so every markdown-to-HTML path
@@ -23,6 +24,32 @@
  *
  * @module chat-render
  */
+
+import {
+  createAgentEntry,
+  createApprovalCard,
+  createErrorBlock,
+  createLoader,
+  createQuestionCard,
+  createSessionDivider,
+  createTaskCard,
+  createTextBlock,
+  createThinkingBlock,
+  createToolGroup,
+  createTurnFooter,
+  createUserEntry,
+  PLAN_TOOL_KEY,
+  QUESTION_TOOL_KEY,
+  toolKey,
+} from './chat-blocks.js';
+
+export { elem } from './chat-blocks.js';
+
+/** @typedef {import('./chat-blocks.js').LoaderHandle} LoaderHandle */
+/** @typedef {import('./chat-blocks.js').ThinkingBlock} ThinkingBlock */
+/** @typedef {import('./chat-blocks.js').ToolGroup} ToolGroup */
+/** @typedef {import('./chat-blocks.js').TaskCard} TaskCard */
+/** @typedef {import('./chat-blocks.js').PermissionBody} PermissionBody */
 
 /**
  * A chat event, post server-side stripping (see routes/chat.py
@@ -52,13 +79,98 @@
  */
 
 /**
- * @returns {{ DOMPurify: any, hljs: any }} the vendored sanitiser/highlighter
- *   globals, each possibly `undefined`. (`marked` is reached via
- *   {@link chatMarkedParse}, which isolates chat from the shared singleton.)
+ * @returns {{ DOMPurify: any, hljs: any, katex: any }} the vendored
+ *   sanitiser/highlighter/math globals, each possibly `undefined`. (`marked` is
+ *   reached via {@link chatMarkedParse}, which isolates chat from the shared
+ *   singleton.)
  */
 function markdownGlobals() {
   const g = /** @type {any} */ (globalThis);
-  return { DOMPurify: g.DOMPurify, hljs: g.hljs };
+  return { DOMPurify: g.DOMPurify, hljs: g.hljs, katex: g.katex };
+}
+
+// ---- Math ---- //
+
+/**
+ * Math delimiters, in extraction order, each with whether it is display math.
+ * Inline `$…$` follows the pandoc rule — no space just inside either dollar,
+ * no digit just outside — so prices like "$5 and $10" stay text; `\$` is a
+ * literal dollar.
+ * @type {Array<[RegExp, boolean]>}
+ */
+const MATH_PATTERNS = [
+  [/\$\$([\s\S]+?)\$\$/g, true],
+  [/\\\[([\s\S]+?)\\\]/g, true],
+  [/\\\(([\s\S]+?)\\\)/g, false],
+  [/(?<![$\d\\])\$(?![\s$])([^\n$]+?)(?<![\s\\])\$(?!\d)/g, false],
+];
+
+/** Fenced blocks and code spans; split on it, odd parts are code and stay literal. */
+const CODE_SPLIT = /(```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]+`)/;
+
+/** The placeholder a math expression rides through marked and DOMPurify as. */
+const MATH_TOKEN = /OSPREYMATH(\d+)Z/g;
+
+/**
+ * Swap every math expression outside code for a plain-text placeholder, so
+ * marked never sees (and mangles) its `_`, `^` and `\`.
+ * @param {string} text
+ * @param {Array<{expr: string, display: boolean, raw: string}>} found - filled in
+ * @returns {string}
+ */
+function extractMath(text, found) {
+  return text
+    .split(CODE_SPLIT)
+    .map((part, i) => {
+      if (i % 2 === 1) return part;
+      for (const [re, display] of MATH_PATTERNS) {
+        part = part.replace(re, (raw, expr) => {
+          found.push({ expr, display, raw });
+          return `OSPREYMATH${found.length - 1}Z`;
+        });
+      }
+      return part;
+    })
+    .join('');
+}
+
+/**
+ * Typeset the placeholders left in `el`'s text nodes. Done on the DOM after
+ * sanitising, so KaTeX output never passes through, or around, the HTML string.
+ * @param {HTMLElement} el
+ * @param {Array<{expr: string, display: boolean, raw: string}>} found
+ * @param {any} katex
+ */
+function mountMath(el, found, katex) {
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  /** @type {Text[]} */
+  const nodes = [];
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    if (n.nodeValue?.includes('OSPREYMATH')) nodes.push(/** @type {Text} */ (n));
+  }
+  for (const node of nodes) {
+    const s = node.nodeValue ?? '';
+    const frag = document.createDocumentFragment();
+    let last = 0;
+    for (const m of s.matchAll(MATH_TOKEN)) {
+      frag.append(s.slice(last, m.index));
+      const item = found[Number(m[1])];
+      const span = document.createElement('span');
+      try {
+        katex.render(item.expr.trim(), span, {
+          displayMode: item.display,
+          throwOnError: false,
+          strict: false,
+        });
+      } catch {
+        span.textContent = item ? item.raw : m[0];
+      }
+      frag.append(span);
+      last = (m.index ?? 0) + m[0].length;
+    }
+    frag.append(s.slice(last));
+    node.replaceWith(frag);
+  }
 }
 
 /**
@@ -124,10 +236,12 @@ function chatMarkedParse() {
  *
  * @param {HTMLElement} el - target element; its contents are replaced
  * @param {string} text - raw markdown (model output)
+ * @param {{ math?: boolean }} [options] - `math` typesets `$…$`, `$$…$$`,
+ *   `\(…\)` and `\[…\]` with KaTeX when it is loaded
  * @returns {void}
  */
-export function renderMarkdownInto(el, text) {
-  const { DOMPurify, hljs } = markdownGlobals();
+export function renderMarkdownInto(el, text, { math = false } = {}) {
+  const { DOMPurify, hljs, katex } = markdownGlobals();
   const parse = chatMarkedParse();
 
   // Fail safe: without a parser or a sanitiser we cannot emit HTML, so degrade
@@ -137,9 +251,12 @@ export function renderMarkdownInto(el, text) {
     return;
   }
 
+  /** @type {Array<{expr: string, display: boolean, raw: string}>} */
+  const found = [];
+  const withMath = math && katex && typeof katex.render === 'function';
   let clean;
   try {
-    clean = DOMPurify.sanitize(parse(text));
+    clean = DOMPurify.sanitize(parse(withMath ? extractMath(text, found) : text));
   } catch {
     // Any failure in parse/sanitise falls back to inert text rather than
     // risking unsanitised markup reaching the DOM.
@@ -147,6 +264,7 @@ export function renderMarkdownInto(el, text) {
     return;
   }
   el.innerHTML = clean;
+  if (found.length) mountMath(el, found, katex);
 
   if (hljs && typeof hljs.highlightElement === 'function') {
     el.querySelectorAll('pre code').forEach((block) => {
@@ -368,117 +486,64 @@ export function activityLabel(event) {
   return `Using ${event.tool_name ?? event.tool_name_raw ?? 'tool'}…`;
 }
 
-// ---- Pure DOM builders ---- //
-
-/**
- * Create an element with a class and optional text. Shared with chat.js —
- * the chat modules never write markup through this builder.
- * @param {string} tag
- * @param {string} className
- * @param {string} [text] - assigned via textContent (never innerHTML)
- * @returns {HTMLElement}
- */
-export function elem(tag, className, text) {
-  const node = document.createElement(tag);
-  node.className = className;
-  if (text !== undefined) node.textContent = text;
-  return node;
-}
-
-/**
- * Build an operator (user) log entry — plain text, no markdown.
- * @param {string} text
- * @returns {HTMLElement}
- */
-function buildUserEntry(text) {
-  const entry = elem('div', 'op-entry operator');
-  entry.appendChild(elem('div', 'op-entry-prefix', 'Operator'));
-  entry.appendChild(elem('div', 'op-entry-body', text));
-  return entry;
-}
-
-/**
- * Build an empty agent (assistant) log entry. The body carries both
- * `op-entry-body` (console styling) and `osprey-md-rendered` (the shared
- * markdown-content class), and is the element {@link renderMarkdownInto}
- * writes into as text streams in.
- * @returns {{ entry: HTMLElement, body: HTMLElement }}
- */
-function buildAgentEntry() {
-  const entry = elem('div', 'op-entry assistant');
-  entry.appendChild(elem('div', 'op-entry-prefix', 'Osprey'));
-  const body = elem('div', 'op-entry-body osprey-md-rendered');
-  entry.appendChild(body);
-  return { entry, body };
-}
-
-/**
- * Build an error block. Rendered from error events; text only.
- * @param {string} message
- * @returns {HTMLElement}
- */
-function buildErrorEntry(message) {
-  return elem('div', 'op-error-block', message);
-}
-
-/**
- * Build a session-reset divider (a centred system notice).
- * @returns {HTMLElement}
- */
-function buildSessionResetDivider() {
-  return elem('div', 'op-system', 'session reset');
-}
-
-/**
- * Build the transient activity line (LED + label). Created inactive; the
- * renderer toggles `.active` (which flips its `display`) as work starts/stops.
- * @param {string} label
- * @returns {{ line: HTMLElement, labelEl: HTMLElement }}
- */
-function buildActivityLine(label) {
-  const line = elem('div', 'op-processing');
-  line.appendChild(elem('span', 'op-processing-led'));
-  const labelEl = elem('span', 'op-processing-label', label);
-  line.appendChild(labelEl);
-  return { line, labelEl };
-}
-
 // ---- Stateful renderer ---- //
 
 /**
  * @typedef {object} ChatRenderer
  * @property {(text: string) => HTMLElement} addUserMessage - append an
- *   operator entry and return it
+ *   operator bubble and return it
  * @property {(markdown: string) => HTMLElement} addAgentMessage - append a
  *   finished agent entry rendered from markdown and return it
  * @property {(turns: ChatTurn[] | null | undefined) => number} replay - render
  *   prior conversation turns, leaving the session-reset divider state
  *   untouched; returns the number of entries rendered
+ * @property {() => void} beginTurn - start a turn: shows the live loader
  * @property {(event: ChatEvent) => void} handleEvent - dispatch one SSE event
+ * @property {() => void} endTurn - finish the turn: hides the loader and marks
+ *   any card still waiting on the operator as cancelled
  * @property {() => void} reset - clear the list and all per-conversation state
  * @property {() => number} messageCount - rendered message entries so far
- *   (excludes dividers/activity); primarily for tests
+ *   (excludes dividers and the loader); primarily for tests
+ */
+
+/**
+ * @typedef {object} RendererOptions
+ * @property {(requestId: string, body: PermissionBody) => Promise<unknown>} [answerPermission]
+ *   delivers a card's answer; rejects with `status` 404 once the request is gone
+ */
+
+/**
+ * The agent entry of the turn in flight, and the block it is writing into.
+ * @typedef {object} AgentTurn
+ * @property {HTMLElement} entry
+ * @property {HTMLElement | null} body - the open text block's body, or null
+ * @property {string[]} texts - raw markdown of each text block, in order (the copy source)
+ * @property {ThinkingBlock | null} thinking - the open thinking block, or null
+ * @property {ToolGroup | null} group - the open tool group, or null
+ * @property {TaskCard | null} tasks - the turn's one plan card, once it has one
  */
 
 /**
  * Create a chat renderer bound to a message-list container (the `op-messages`
- * element). The renderer appends entries in arrival order and keeps the
- * activity line pinned to the bottom of the log.
+ * element). The renderer appends entries in arrival order, keeps the loader
+ * pinned to the bottom of the log while a turn runs, and routes each event to
+ * the block it belongs in.
  *
  * @param {HTMLElement} container - the `op-messages` scroll region
+ * @param {RendererOptions} [options]
  * @returns {ChatRenderer}
  */
-export function createChatRenderer(container) {
+export function createChatRenderer(container, options = {}) {
   /**
    * Count of rendered *message* entries (operator / agent / error) in the
-   * current conversation. Dividers and the activity line don't count. Reported
-   * by {@link messageCount} (primarily for tests).
+   * current conversation. Dividers and the loader don't count. Reported by
+   * {@link messageCount} (primarily for tests).
    */
   let count = 0;
 
   /**
-   * Whether a prior agent exchange — an agent message or a finalised turn —
-   * has been rendered in this conversation. Gates the session-reset divider.
+   * Whether a prior agent exchange — an agent message or a finished turn — has
+   * been rendered in this conversation. Gates the session-reset divider.
    *
    * The real turn sequence is: the controller appends the operator's bubble,
    * *then* opens the stream, and a fresh server session emits `session_reset`
@@ -490,74 +555,237 @@ export function createChatRenderer(container) {
    */
   let hasPriorExchange = false;
 
-  /** The in-progress agent entry's body, or null between turns. */
-  let agentBody = /** @type {HTMLElement | null} */ (null);
-  /** Text accumulated across `text` events for the current agent entry. */
-  let agentText = '';
-  /** The activity line, created lazily on first use and then reused. */
-  let activity = /** @type {{ line: HTMLElement, labelEl: HTMLElement } | null} */ (null);
+  /** Whether a turn is in flight: from beginTurn until endTurn. */
+  let running = false;
+  /** When the turn in flight began (epoch ms); the loader and footer count from here. */
+  let startedAt = 0;
+  /** The loader's label: the current activity. */
+  let activity = 'Working…';
+  /** Whether text is streaming now; the loader steps aside while it does. */
+  let streamingText = false;
+  /** The live loader, created on first use and then reused. */
+  let loader = /** @type {LoaderHandle | null} */ (null);
+  /** The agent entry of the turn in flight, or null before its first block. */
+  let turn = /** @type {AgentTurn | null} */ (null);
+  /** Tool chips of the turn in flight, keyed by `tool_use_id`. */
+  const chips = new Map();
+  /** Permission cards of the turn in flight, keyed by `request_id`. */
+  const cards = new Map();
+  /** Subagent chips of the turn in flight, keyed by the call's `tool_use_id`. */
+  const agents = new Map();
 
   /**
-   * Append an entry, keeping the activity line (if present) last so it always
-   * reads as the current status beneath the latest message.
-   * @param {HTMLElement} node
+   * The agent chip a record belongs to, when it is a subagent's own. A record
+   * whose parent is not a chip here (a subagent of a subagent) has no place
+   * in the operator log and is dropped rather than shown as the main agent's.
+   * @param {Record<string, any>} event
+   * @returns {{ agent: any, nested: boolean }}
+   */
+  function ownerOf(event) {
+    const parent = event.parent_tool_use_id;
+    if (!parent) return { agent: null, nested: false };
+    return { agent: agents.get(String(parent)) ?? null, nested: true };
+  }
+
+  const answer =
+    options.answerPermission ??
+    (async () => {
+      throw new Error('Permission answers are not wired up.');
+    });
+
+  /**
+   * Append a node to the log, keeping the loader (when it is showing) last so
+   * it always reads as the current status beneath the latest message.
+   * @param {Node} node
    */
   function append(node) {
     container.appendChild(node);
-    if (activity && activity.line.parentNode === container) {
-      container.appendChild(activity.line);
-    }
+    if (loader?.el.isConnected) container.appendChild(loader.el);
   }
 
   /**
-   * Show the activity line with `label`, creating it on first use.
-   * @param {string} label
+   * The current turn's agent entry, created with the turn's first block.
+   * @returns {AgentTurn}
    */
-  function setActivity(label) {
-    if (!activity) activity = buildActivityLine(label);
-    else activity.labelEl.textContent = label;
-    activity.line.classList.add('active');
-    container.appendChild(activity.line); // move/keep at the bottom
+  function ensureTurn() {
+    if (turn) return turn;
+    const entry = createAgentEntry();
+    count += 1;
+    hasPriorExchange = true;
+    turn = { entry, body: null, texts: [], thinking: null, group: null, tasks: null };
+    append(entry);
+    return turn;
   }
 
-  /** Hide the activity line (kept in the DOM, inert, for reuse). */
-  function clearActivity() {
-    if (activity) activity.line.classList.remove('active');
+  /** @param {AgentTurn} t */
+  function closeText(t) {
+    t.body = null;
+  }
+
+  /** @param {AgentTurn} t */
+  function closeThinking(t) {
+    if (t.thinking) {
+      t.thinking.finish();
+      t.thinking = null;
+    }
+  }
+
+  /** @param {AgentTurn} t */
+  function closeGroup(t) {
+    if (t.group) {
+      t.group.settle();
+      t.group = null;
+    }
+  }
+
+  /** @param {AgentTurn} t */
+  function closeAll(t) {
+    closeText(t);
+    closeThinking(t);
+    closeGroup(t);
+  }
+
+  /** @param {string} chunk */
+  function appendText(chunk) {
+    const t = ensureTurn();
+    closeThinking(t);
+    closeGroup(t);
+    let body = t.body;
+    if (!body) {
+      body = createTextBlock();
+      t.body = body;
+      t.texts.push('');
+      t.entry.appendChild(body);
+    }
+    const i = t.texts.length - 1;
+    t.texts[i] += chunk;
+    renderMarkdownInto(body, t.texts[i], { math: true });
+  }
+
+  /** @param {string} chunk */
+  function appendThinking(chunk) {
+    const t = ensureTurn();
+    closeText(t);
+    closeGroup(t);
+    if (!t.thinking) {
+      t.thinking = createThinkingBlock();
+      t.entry.appendChild(t.thinking.el);
+    }
+    t.thinking.add(chunk);
+  }
+
+  /** @param {Record<string, any>} event - a `tool_use` event */
+  function appendToolUse(event) {
+    const t = ensureTurn();
+    closeText(t);
+    closeThinking(t);
+    if (!t.group) {
+      t.group = createToolGroup();
+      t.entry.appendChild(t.group.el);
+    }
+    const raw = String(event.tool_name_raw ?? '');
+    const id = String(event.tool_use_id ?? '');
+    if (raw === 'Agent' || raw === 'Task') {
+      const agent = t.group.addAgent(event, (el, text) =>
+        renderMarkdownInto(el, text, { math: true }),
+      );
+      if (id) {
+        agents.set(id, agent);
+        chips.set(id, agent);
+      }
+      return;
+    }
+    const chip = t.group.addTool(event);
+    if (id) chips.set(id, chip);
+  }
+
+  /** @param {Record<string, any>} event - a `tool_use` event for TodoWrite */
+  function upsertPlan(event) {
+    const todos = event.input?.todos;
+    const items = Array.isArray(todos) ? todos.filter((item) => item && typeof item === 'object') : [];
+    const t = ensureTurn();
+    if (!t.tasks) {
+      closeAll(t);
+      t.tasks = createTaskCard();
+      t.entry.appendChild(t.tasks.el);
+    }
+    t.tasks.update(items);
+  }
+
+  /** @param {Record<string, any>} request - a `permission_request` event */
+  function appendPermission(request) {
+    const t = ensureTurn();
+    closeAll(t);
+    const id = String(request.request_id ?? '');
+    const hooks = {
+      answer: (/** @type {PermissionBody} */ body) => answer(id, body),
+      onSettled: () => syncLoader(),
+    };
+    const card =
+      request.kind === 'question'
+        ? createQuestionCard(request, hooks)
+        : createApprovalCard(request, hooks);
+    cards.set(id, card);
+    t.entry.appendChild(card.el);
+    card.focus();
+  }
+
+  /** @param {Record<string, any>} event - the `result` event */
+  function appendFooter(event) {
+    if (!turn) return;
+    const text = turn.texts.filter((part) => part.trim()).join('\n\n');
+    const durationMs =
+      typeof event.duration_ms === 'number' ? event.duration_ms : Date.now() - startedAt;
+    turn.entry.appendChild(
+      createTurnFooter({ durationMs, text, isError: Boolean(event.is_error) }),
+    );
   }
 
   /**
-   * Ensure an agent entry exists for the current turn and stream `chunk` into
-   * it. The first `text` event of a turn creates the entry (and clears any
-   * activity line); subsequent events accumulate and re-render.
-   * @param {string} chunk
+   * Show the loader while a turn runs and nothing is streaming or waiting on
+   * the operator. Otherwise stop its clock and take it out of the log.
    */
-  function appendAgentText(chunk) {
-    clearActivity();
-    if (!agentBody) {
-      const { entry, body } = buildAgentEntry();
-      agentBody = body;
-      agentText = '';
-      count += 1;
-      hasPriorExchange = true;
-      append(entry);
+  function syncLoader() {
+    const waiting = [...cards.values()].some((card) => card.pending);
+    if (!running || streamingText || waiting) {
+      loader?.stop();
+      loader?.el.remove();
+      return;
     }
-    agentText += chunk;
-    renderMarkdownInto(agentBody, agentText);
+    if (!loader) loader = createLoader();
+    loader.setLabel(activity);
+    loader.start(startedAt);
+    if (container.lastElementChild !== loader.el) container.appendChild(loader.el);
   }
 
-  /** End the current agent turn: drop the streaming buffer and activity line. */
-  function finishTurn() {
-    clearActivity();
-    agentBody = null;
-    agentText = '';
+  /**
+   * Close the turn in flight: settle its open blocks, cancel every card still
+   * waiting (the server has moved on without those answers), and forget its
+   * chips. The running state is left alone — see {@link endTurn}.
+   */
+  function dropTurn() {
+    if (turn) closeAll(turn);
+    turn = null;
+    for (const card of cards.values()) card.cancel();
+    cards.clear();
+    for (const agent of agents.values()) agent.finish({ status: 'stopped' });
+    agents.clear();
+    chips.clear();
+    streamingText = false;
+  }
+
+  /** The turn is over: a result, a terminal error, or a closed stream. */
+  function endTurn() {
+    dropTurn();
+    running = false;
+    syncLoader();
   }
 
   /** @param {string} text */
   function addUserMessage(text) {
-    // A new operator message starts a new turn; abandon any dangling stream.
-    agentBody = null;
-    agentText = '';
-    const entry = buildUserEntry(text);
+    // A new operator message starts a new turn; abandon any dangling one.
+    endTurn();
+    const entry = createUserEntry(text);
     count += 1;
     append(entry);
     return entry;
@@ -565,22 +793,21 @@ export function createChatRenderer(container) {
 
   /**
    * Append a finished agent entry rendered from `markdown` in one go — the
-   * whole-message counterpart to the streamed {@link appendAgentText} path,
-   * and through the same sanitising {@link renderMarkdownInto} boundary. Any
-   * in-progress stream is abandoned, so the next `text` event opens a fresh
-   * entry.
+   * whole-message counterpart to the streamed text path, through the same
+   * sanitising {@link renderMarkdownInto} boundary.
    * @param {string} markdown
    * @returns {HTMLElement}
    */
   function addAgentMessage(markdown) {
-    clearActivity();
-    agentBody = null;
-    agentText = '';
-    const { entry, body } = buildAgentEntry();
-    renderMarkdownInto(body, markdown);
+    dropTurn();
+    const entry = createAgentEntry();
+    const body = createTextBlock();
+    renderMarkdownInto(body, markdown, { math: true });
+    entry.appendChild(body);
     count += 1;
     hasPriorExchange = true;
     append(entry);
+    syncLoader();
     return entry;
   }
 
@@ -600,79 +827,152 @@ export function createChatRenderer(container) {
   function replay(turns) {
     const priorExchange = hasPriorExchange;
     let rendered = 0;
-    for (const turn of turns ?? []) {
-      const content = turn?.content ?? '';
-      if (!content) continue;
-      if ((turn.role ?? '').toLowerCase() === 'user') addUserMessage(content);
-      else addAgentMessage(content);
+    for (const turnItem of turns ?? []) {
+      const content = turnItem?.content ?? '';
+      const events = Array.isArray(turnItem?.events) ? turnItem.events : null;
+      if ((turnItem.role ?? '').toLowerCase() === 'user') {
+        if (!content) continue;
+        addUserMessage(content);
+      } else if (events?.length) {
+        // The same path a live stream takes, so thinking, tool chips and the
+        // plan come back exactly as they were drawn; `result` closes the turn.
+        for (const event of events) handleEvent(event);
+        endTurn();
+      } else if (content) {
+        addAgentMessage(content);
+      } else {
+        continue;
+      }
       rendered += 1;
     }
     hasPriorExchange = priorExchange;
     return rendered;
   }
 
+  function beginTurn() {
+    running = true;
+    startedAt = Date.now();
+    activity = 'Working…';
+    streamingText = false;
+    syncLoader();
+  }
+
   /** @param {ChatEvent} event */
   function handleEvent(event) {
     switch (event.type) {
-      case 'text':
-        appendAgentText(event.content ?? '');
+      case 'text': {
+        const { agent, nested } = ownerOf(event);
+        if (nested) {
+          agent?.addText(event.content ?? '');
+          break;
+        }
+        streamingText = true;
+        appendText(event.content ?? '');
         break;
+      }
       case 'thinking':
-        setActivity('Thinking…');
+        // A subagent's reasoning stays inside it; its chip shows its work.
+        if (ownerOf(event).nested) break;
+        streamingText = false;
+        activity = 'Thinking…';
+        appendThinking(event.content ?? '');
         break;
-      case 'tool_use':
-        setActivity(activityLabel(event));
+      case 'tool_use': {
+        const { agent, nested } = ownerOf(event);
+        if (nested) {
+          if (agent) {
+            const chip = agent.addTool(event);
+            if (event.tool_use_id) chips.set(String(event.tool_use_id), chip);
+            activity = `${agent.name} · ${activityLabel(event)}`;
+          }
+          break;
+        }
+        streamingText = false;
+        const key = toolKey(event.tool_name_raw ?? event.tool_name);
+        activity = key === QUESTION_TOOL_KEY ? 'Preparing a question…' : activityLabel(event);
+        if (key === PLAN_TOOL_KEY) upsertPlan(event);
+        else if (key !== QUESTION_TOOL_KEY) appendToolUse(event);
         break;
+      }
       case 'tool_result':
-        // Stripped of its body; nothing to render. The activity line stays as
-        // it is until the next text/thinking/tool_use event moves it.
+        streamingText = false;
+        chips.get(String(event.tool_use_id ?? ''))?.finish(event);
+        break;
+      case 'permission_request':
+        streamingText = false;
+        appendPermission(event);
         break;
       case 'result':
-        // Turn boundary. Errors surface via `error` events, so a result only
-        // finalises streaming state here — but it does mark a completed
-        // exchange, so a later reset earns its divider.
+        // Turn boundary. A result finalises the turn and earns the footer; it
+        // also marks a completed exchange, so a later reset earns its divider.
+        streamingText = false;
         hasPriorExchange = true;
-        finishTurn();
+        appendFooter(event);
+        endTurn();
         break;
       case 'session_reset':
-        // Show the divider only when a completed exchange already sits above
+        // The divider shows only when a completed exchange already sits above
         // this reset; the current turn's own user bubble is not enough (that is
-        // the fresh-session first turn). The divider is not a message, so it
-        // doesn't bump `count`.
+        // the fresh-session first turn). The divider is not a message.
         if (hasPriorExchange) {
-          finishTurn();
-          append(buildSessionResetDivider());
+          dropTurn();
+          append(createSessionDivider());
         }
         break;
       case 'error': {
-        clearActivity();
-        agentBody = null;
-        agentText = '';
+        streamingText = false;
         count += 1;
         hasPriorExchange = true;
-        append(buildErrorEntry(event.message ?? 'An error occurred.'));
+        const block = createErrorBlock(event.message ?? 'An error occurred.');
+        if (turn) turn.entry.appendChild(block);
+        else append(block);
+        // An assistant-message error leaves the turn streaming; anything else ends it.
+        if (event.error_type !== 'AssistantMessageError') endTurn();
         break;
       }
+      case 'system':
+        // `background_wait`: the agent handed work to a background agent; the
+        // turn stays open until it reports, and the loader says what it is
+        // waiting on. `agent_done`: that report, which settles its chip. Other
+        // `system` frames are not rendered in the operator log.
+        if (event.subtype === 'background_wait') {
+          streamingText = false;
+          activity = 'Waiting for the background agent…';
+          // What the agent says once the report lands is a new paragraph.
+          if (turn) closeText(turn);
+        } else if (event.subtype === 'agent_done') {
+          if (turn) closeText(turn);
+          agents.get(String(event.tool_use_id ?? ''))?.finish({
+            status: event.status,
+            summary: event.summary,
+            is_error: event.status === 'failed',
+          });
+        }
+        break;
       default:
-        // `system` and any unknown types are not rendered in the operator log.
+        // Unknown types are not rendered in the operator log.
         break;
     }
+    syncLoader();
   }
 
   function reset() {
+    dropTurn();
+    running = false;
+    loader?.stop();
+    loader = null;
     container.replaceChildren();
     count = 0;
     hasPriorExchange = false;
-    agentBody = null;
-    agentText = '';
-    activity = null;
   }
 
   return {
     addUserMessage,
     addAgentMessage,
     replay,
+    beginTurn,
     handleEvent,
+    endTurn,
     reset,
     messageCount: () => count,
   };

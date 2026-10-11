@@ -283,6 +283,20 @@ class AgentSession:
         except ClaudeSDKError as exc:
             raise from_sdk_error(exc) from exc
 
+    async def stop_task(self, task_id: str) -> None:
+        """Stop one background task the agent started (a background subagent).
+
+        The CLI then reports it with a ``task_notification`` of status
+        ``stopped`` in the response stream.
+
+        Raises:
+            AgentRunError: When the agent SDK fails to deliver the request.
+        """
+        try:
+            await self._client.stop_task(task_id)
+        except ClaudeSDKError as exc:
+            raise from_sdk_error(exc) from exc
+
     def _transport_process(self) -> Any:
         """The child process handle the client's transport holds, if any.
 

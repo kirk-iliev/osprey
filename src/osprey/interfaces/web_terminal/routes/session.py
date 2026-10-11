@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from dataclasses import asdict
-from typing import TYPE_CHECKING
+from datetime import datetime
+from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Request
 
@@ -12,6 +15,8 @@ from osprey.interfaces.web_terminal import transcript_map
 from osprey.interfaces.web_terminal.session_discovery import SessionDiscovery
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from osprey.mcp_server.workspace.transcript_reader import TranscriptReader
 
 logger = logging.getLogger(__name__)
@@ -196,10 +201,155 @@ async def session_summary(request: Request):
 #: by hand is not handed a silently shortened conversation.
 _FULL_HISTORY_VALUES = frozenset({"1", "true", "yes", "on"})
 
+#: How the CLI opens the user message it injects when a background agent reports.
+_TASK_NOTIFICATION_MARK = "<task-notification>"
+
+
+def _notification_field(text: str, tag: str) -> str:
+    """The contents of ``<tag>…</tag>`` in a task notification, or an empty string."""
+    match = re.search(rf"<{tag}>(.*?)</{tag}>", text, re.DOTALL)
+    return match.group(1).strip() if match else ""
+
+
+def _agent_done_event(text: str) -> dict[str, Any]:
+    """The ``agent_done`` frame the live chat drew for this background agent's report."""
+    status = _notification_field(text, "status")
+    return {
+        "type": "system",
+        "subtype": "agent_done",
+        "tool_use_id": _notification_field(text, "tool-use-id"),
+        "status": "stopped" if status == "killed" else status,
+        "summary": _notification_field(text, "summary"),
+    }
+
 
 def _wants_full_messages(request: Request) -> bool:
     """Whether the caller asked for whole messages via the ``full`` flag."""
     return request.query_params.get("full", "").strip().lower() in _FULL_HISTORY_VALUES
+
+
+def _wants_events(request: Request) -> bool:
+    """Whether the caller asked for agent turns as replayable chat events."""
+    return request.query_params.get("events", "").strip().lower() in _FULL_HISTORY_VALUES
+
+
+def _ts(value: Any) -> datetime | None:
+    """A transcript timestamp as a datetime, or ``None`` when it is unreadable."""
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
+def _chat_timeline(path: Path) -> list[dict[str, Any]]:
+    """Read a transcript as the Simple chat's turns, agent turns carrying their events.
+
+    A user turn is ``{role, content, timestamp}``. Everything the agent did up
+    to the next user prompt is one assistant turn whose ``events`` are the
+    frames a live stream would have carried — ``text``, ``thinking``,
+    ``tool_use``, ``tool_result`` — closed by a ``result`` whose duration is
+    read off the transcript's timestamps. ``content`` holds the turn's joined
+    text, so a client that ignores ``events`` still replays the words.
+    """
+    from osprey.interfaces.web_terminal.operator_session import (
+        _TOOL_RESULT_PREVIEW_CHARS,
+        _format_tool_name,
+    )
+    from osprey.interfaces.web_terminal.routes.chat import _clip_input
+    from osprey.mcp_server.workspace.transcript_reader import (
+        _extract_text,
+        is_bookkeeping_entry,
+    )
+
+    turns: list[dict[str, Any]] = []
+    agent: dict[str, Any] | None = None
+    started: datetime | None = None
+    last: datetime | None = None
+
+    def close_agent() -> None:
+        nonlocal agent
+        if agent is None:
+            return
+        duration = (last - started).total_seconds() * 1000 if started and last else None
+        agent["events"].append({"type": "result", "is_error": False, "duration_ms": duration})
+        agent["content"] = "\n\n".join(e["content"] for e in agent["events"] if e["type"] == "text")
+        turns.append(agent)
+        agent = None
+
+    for line in path.read_text().splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        kind = entry.get("type")
+        if kind not in ("user", "assistant") or entry.get("isSidechain"):
+            continue
+        if is_bookkeeping_entry(entry):
+            continue
+        blocks = entry.get("message", {}).get("content", [])
+        if isinstance(blocks, str):
+            blocks = [{"type": "text", "text": blocks}]
+        stamp = _ts(entry.get("timestamp", ""))
+
+        if kind == "user":
+            text = "\n".join(
+                b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"
+            ).strip()
+            # A background agent's report is injected as a user message; it
+            # continues the agent's turn rather than starting an operator one.
+            if text and not text.startswith(_TASK_NOTIFICATION_MARK):
+                close_agent()
+                turns.append(
+                    {"role": "user", "content": text, "timestamp": entry.get("timestamp", "")}
+                )
+                started = stamp
+                continue
+
+        if agent is None:
+            agent = {
+                "role": "assistant",
+                "content": "",
+                "events": [],
+                "timestamp": entry.get("timestamp", ""),
+            }
+        if stamp is not None:
+            last = stamp
+        if kind == "user" and text.startswith(_TASK_NOTIFICATION_MARK):
+            agent["events"].append(_agent_done_event(text))
+            continue
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text" and kind == "assistant" and block.get("text", "").strip():
+                agent["events"].append({"type": "text", "content": block["text"]})
+            elif btype == "thinking":
+                agent["events"].append({"type": "thinking", "content": block.get("thinking", "")})
+            elif btype == "tool_use":
+                name = block.get("name", "")
+                agent["events"].append(
+                    {
+                        "type": "tool_use",
+                        "tool_name": _format_tool_name(name),
+                        "tool_name_raw": name,
+                        "tool_use_id": block.get("id", ""),
+                        "input": _clip_input(block.get("input", {})),
+                    }
+                )
+            elif btype == "tool_result":
+                content = block.get("content")
+                text = content if isinstance(content, str) else _extract_text(content or [])
+                agent["events"].append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.get("tool_use_id", ""),
+                        "is_error": bool(block.get("is_error")),
+                        "preview": text[:_TOOL_RESULT_PREVIEW_CHARS],
+                        "truncated": len(text) > _TOOL_RESULT_PREVIEW_CHARS,
+                    }
+                )
+    close_agent()
+    return turns
 
 
 @router.get("/api/session-chat")
@@ -222,7 +372,10 @@ async def session_chat(request: Request):
         session_id = request.query_params.get("session_id")
         if session_id:
             transcript_id = transcript_map.get(request.app, session_id)
-            if _wants_full_messages(request):
+            if _wants_events(request):
+                path = reader.find_transcript_by_id(transcript_id)
+                turns = _chat_timeline(path) if path else []
+            elif _wants_full_messages(request):
                 turns = reader.read_chat_history_by_id(transcript_id, max_chars=None)
             else:
                 turns = reader.read_chat_history_by_id(transcript_id)

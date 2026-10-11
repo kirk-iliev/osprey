@@ -25,8 +25,9 @@
 import { pickUiMode } from '/design-system/js/frame-params.js';
 import { uuid4 } from '/design-system/js/uuid.js';
 
-import { fetchCommands, fetchHistory, interrupt, requestHandoff, sendPrompt } from './chat-client.js';
+import { answerPermission, fetchCommands, fetchHistory, interrupt, requestHandoff, sendPrompt } from './chat-client.js';
 import { createChatRenderer, elem } from './chat-render.js';
+import { chatIcon } from './chat-icons.js';
 import { buildEmptyState, onKindChange, onSettled, renderEmptyStateContent } from './first-contact.js';
 import { getPointer, setPointer, subscribe as subscribeToPointer } from './session-pointer.js';
 import { attachSlashComplete } from './slash-complete.js';
@@ -164,27 +165,36 @@ function buildConsole() {
   textarea.rows = 1;
   textarea.setAttribute('aria-label', 'Operator message');
 
-  const sendBtn = /** @type {HTMLButtonElement} */ (elem('button', 'op-send-btn', 'Send'));
+  // The composer's own controls. Send and Stop share one slot: a turn swaps one
+  // for the other, so the button under the pointer is always the one on screen.
+  const cmdBtn = /** @type {HTMLButtonElement} */ (elem('button', 'op-cmd-btn', '/'));
+  cmdBtn.type = 'button';
+  cmdBtn.title = 'Slash commands';
+  cmdBtn.setAttribute('aria-label', 'Show slash commands');
+
+  const sendBtn = /** @type {HTMLButtonElement} */ (elem('button', 'op-send-btn'));
   sendBtn.type = 'button';
-  const stopBtn = /** @type {HTMLButtonElement} */ (elem('button', 'op-stop-btn', 'Stop'));
+  sendBtn.title = 'Send';
+  sendBtn.setAttribute('aria-label', 'Send');
+  sendBtn.append(chatIcon('up'));
+
+  const stopBtn = /** @type {HTMLButtonElement} */ (elem('button', 'op-stop-btn'));
   stopBtn.type = 'button';
+  stopBtn.title = 'Stop';
+  stopBtn.setAttribute('aria-label', 'Stop');
+  stopBtn.append(chatIcon('stop'));
   stopBtn.hidden = true;
 
-  // ORDER IS THE LAYOUT. The textarea takes all the slack (`flex: 1`), so this
-  // cluster is pinned to the row's right edge and a member's arrival moves
-  // everything BEFORE it and nothing after it. Stop is the conditional one —
-  // it exists only while a turn streams — so it goes FIRST and Send stays put.
-  //
-  // The other order is a control-substitution hazard, not just a jump: Stop
-  // hides and Send re-enables in the same statement block (see setStreaming),
-  // so Send would slide into the exact pixels Stop had occupied at the moment
-  // it becomes clickable again — a hand already moving toward Stop as the turn
-  // ends lands on Send instead.
   const controls = elem('div', 'op-input-controls');
   controls.append(stopBtn, sendBtn);
 
+  const toolbar = elem('div', 'op-composer-bar');
+  toolbar.append(cmdBtn, controls);
+
+  // The composer is one rounded surface: the box and its toolbar. `.op-input-area`
+  // is the element the slash list mounts into, and first-contact reaches for it.
   const inputArea = elem('div', 'op-input-area');
-  inputArea.append(elem('span', 'op-prompt-char', '›'), textarea, controls);
+  inputArea.append(textarea, toolbar);
 
   return {
     bar,
@@ -196,6 +206,7 @@ function buildConsole() {
     overlayAction,
     inputArea,
     textarea,
+    cmdBtn,
     sendBtn,
     stopBtn,
   };
@@ -288,11 +299,23 @@ export function initChat(containerId = 'operator-container') {
 
   const handles = buildConsole();
   const { bar, led, newBtn, messages, overlay, overlayMessage, overlayAction } = handles;
-  const { inputArea, textarea, sendBtn, stopBtn } = handles;
+  const { inputArea, textarea, cmdBtn, sendBtn, stopBtn } = handles;
   container.append(bar, messages, overlay, inputArea);
   const slash = attachSlashComplete(textarea, { load: fetchCommands, mount: inputArea });
+  // The "/" button opens the command list as typing a slash would. Its press is
+  // swallowed so focus stays in the box: a blur would close the list the click
+  // is about to open.
+  cmdBtn.addEventListener('mousedown', (e) => e.preventDefault());
+  cmdBtn.addEventListener('click', () => {
+    if (!textarea.value.trim()) textarea.value = '/';
+    textarea.focus();
+    textarea.dispatchEvent(new Event('input'));
+  });
 
-  const renderer = createChatRenderer(messages);
+  const renderer = createChatRenderer(messages, {
+    answerPermission: (requestId, body) =>
+      answerPermission(boundKey, { request_id: requestId, ...body }),
+  });
 
   /** In-flight turn handle, or null when idle. */
   let handle = /** @type {import('./chat-client.js').ChatAbortHandle | null} */ (null);
@@ -384,8 +407,10 @@ export function initChat(containerId = 'operator-container') {
   function applyControls() {
     const blocked = streaming || transitioning;
     textarea.disabled = blocked;
+    cmdBtn.disabled = blocked;
     sendBtn.disabled = blocked;
     newBtn.disabled = blocked;
+    sendBtn.hidden = streaming;
     stopBtn.hidden = !streaming;
     stopBtn.disabled = false;
     if (blocked) slash.close();
@@ -691,8 +716,9 @@ export function initChat(containerId = 'operator-container') {
     autoResize();
     scrollToBottom();
     setStreaming(true);
+    renderer.beginTurn();
 
-    handle = sendPrompt(boundKey, prompt, {
+    const current = sendPrompt(boundKey, prompt, {
       onEvent: (event) => {
         // Follow the tail only when the operator hasn't scrolled up to read back.
         const pinned = isPinned();
@@ -714,10 +740,15 @@ export function initChat(containerId = 'operator-container') {
         showHandoffRefused(refusal);
       },
       onClose: () => {
+        // A turn that a reset cut short can close after its successor has started;
+        // only the turn still current may touch the console.
+        if (handle !== current) return;
         handle = null;
         setStreaming(false);
+        renderer.endTurn();
       },
     });
+    handle = current;
   }
 
   /** Stop the in-flight turn: interrupt server-side first, then abort locally. */

@@ -29,11 +29,16 @@ from osprey.agent_runner import (
     SystemEvent,
     TextEvent,
     ThinkingEvent,
+    ToolResultEvent,
     ToolUseEvent,
     agent_session,
 )
 from osprey.agent_runner.clean_env import build_clean_env
-from osprey.agent_runner.sdk_context import build_system_prompt
+from osprey.agent_runner.sdk_context import (
+    PermissionResultAllow,
+    PermissionResultDeny,
+    build_system_prompt,
+)
 from osprey.audit.posture import OSPREY_AGENT_DATA_ROOT
 from osprey.interfaces.web_auth import PANEL_TOKEN_ENV, get_web_credentials
 from osprey.interfaces.web_terminal import process_tree
@@ -260,6 +265,54 @@ _MCP_PREFIX_RE = re.compile(r"^mcp__.+?__")
 # before the reader is hard-cancelled. Enforced inside OperatorSession.cancel().
 _QUIESCE_TIMEOUT_S = 5.0
 
+#: Bound (seconds) for draining a turn stopped while the main agent was idle
+#: waiting on a background agent: the CLI answers the stop with a model turn
+#: of its own, and that must be read off the stream before the next prompt.
+_BACKGROUND_DRAIN_S = 30.0
+
+#: The SDK tool whose permission request is a question for the operator, not a
+#: tool approval: the answer goes back as ``answers`` in the tool's input.
+_QUESTION_TOOL = "AskUserQuestion"
+
+#: How much of a tool's result the chat stream carries — enough for a chip's
+#: preview line, never a whole file or archiver dump.
+_TOOL_RESULT_PREVIEW_CHARS = 600
+
+#: The tools that start a subagent (``Task`` was renamed ``Agent``), and the
+#: text their result opens with when the agent went to the background — it then
+#: reports in a later response of its own.
+_AGENT_TOOLS = frozenset({"Task", "Agent"})
+_ASYNC_LAUNCH_MARK = "Async agent launched"
+
+#: Task statuses that end a background agent, across ``task_notification``'s
+#: and ``task_updated``'s vocabularies (the SDK's TERMINAL_TASK_STATUSES).
+_TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "stopped", "killed"})
+
+
+def _render_arms_writes() -> bool:
+    """Whether this render arms writes on any control target. Fails closed. BLOCKING.
+
+    The chat offers tool approvals only on a write-enabled render (a readwrite
+    or admin persona); a readonly render keeps declining every ask, which is
+    what a chat without a permission callback already did.
+    """
+    try:
+        from osprey.utils.workspace import load_osprey_config
+        from osprey_connectors.types import any_target_writes_enabled
+
+        section = load_osprey_config().get("control_system", {})
+        return bool(any_target_writes_enabled(section))
+    except Exception:
+        logger.warning("Could not read the write posture; chat approvals stay off", exc_info=True)
+        return False
+
+
+def _main_agent_active(event: AgentEvent) -> bool:
+    """Whether *event* is the main agent itself working (not a subagent, not bookkeeping)."""
+    if isinstance(event, (TextEvent, ThinkingEvent, ToolUseEvent)):
+        return event.parent_tool_use_id is None
+    return isinstance(event, SystemEvent) and event.subtype == "init"
+
 
 def _format_tool_name(raw: str) -> str:
     """Convert raw tool name to a human-readable display name.
@@ -293,10 +346,20 @@ def _event_to_wire(event: AgentEvent) -> dict[str, Any] | None:
             "message": f"API error: {event.error}",
             "error_type": "AssistantMessageError",
         }
+    # ``parent_tool_use_id`` names the subagent call a record belongs to (None
+    # for the main agent's own), so the chat can file it under that agent.
     if isinstance(event, TextEvent):
-        return {"type": "text", "content": event.text}
+        return {
+            "type": "text",
+            "content": event.text,
+            "parent_tool_use_id": event.parent_tool_use_id,
+        }
     if isinstance(event, ThinkingEvent):
-        return {"type": "thinking", "content": event.text}
+        return {
+            "type": "thinking",
+            "content": event.text,
+            "parent_tool_use_id": event.parent_tool_use_id,
+        }
     if isinstance(event, ToolUseEvent):
         return {
             "type": "tool_use",
@@ -304,6 +367,7 @@ def _event_to_wire(event: AgentEvent) -> dict[str, Any] | None:
             "tool_name_raw": event.name,
             "tool_use_id": event.tool_use_id,
             "input": event.input,
+            "parent_tool_use_id": event.parent_tool_use_id,
         }
     if isinstance(event, ResultEvent):
         return {
@@ -325,8 +389,16 @@ def _event_to_wire(event: AgentEvent) -> dict[str, Any] | None:
         if session_id:
             frame["session_id"] = session_id
         return frame
-    # The operator stream carries what the agent says and which tool it calls,
-    # never tool output (ToolResultEvent) or any other record.
+    if isinstance(event, ToolResultEvent):
+        text = event.text or ""
+        return {
+            "type": "tool_result",
+            "tool_use_id": event.tool_use_id,
+            "is_error": event.is_error,
+            "preview": text[:_TOOL_RESULT_PREVIEW_CHARS],
+            "truncated": len(text) > _TOOL_RESULT_PREVIEW_CHARS,
+        }
+    # Any other record (stream deltas, rate-limit notices) stays off the stream.
     return None
 
 
@@ -515,6 +587,24 @@ class OperatorSession:
         # creation and re-stamped when a turn's reader completes; the chat
         # registry (issue: chat-registry) uses it as its idle predicate.
         self.last_activity = time.monotonic()
+        # Permission requests waiting on the operator: request id -> (answer
+        # future, the tool input the request was made with). Filled by
+        # ``_can_use_tool``; drained by ``resolve_permission`` or, on interrupt
+        # and teardown, by ``_deny_pending``.
+        self._permissions: dict[str, tuple[asyncio.Future[Any], dict[str, Any]]] = {}
+        # Whether tool approvals are offered at all; read from the render at start.
+        self._approvals = False
+        # Background agents the current turn launched and that have not yet
+        # reported, keyed by the tool_use id that launched them; the agent tool
+        # calls seen this turn; and each started task's id -> its tool_use id.
+        # While any background agent is open the turn stays open (see
+        # ``_stream_response``).
+        self._background: set[str] = set()
+        self._agent_calls: set[str] = set()
+        self._task_calls: dict[str, str] = {}
+        # True while the main agent is idle waiting on a background agent's
+        # report: a Stop then stops the agent and drains, never interrupts.
+        self._idle_wait = False
 
     # ---- Per-turn one-in-flight guard (synchronous, lock-free) ---- #
 
@@ -625,8 +715,10 @@ class OperatorSession:
 
         # The chat routes its own run through the env it hands over (an empty
         # mapping inherits the process environment), sets no permission mode,
-        # turn cap or budget, and waits for no MCP server: the launch carries
-        # the system prompt, cwd, env, project settings and identity only.
+        # turn cap or budget, and waits for no MCP server. Every ask the
+        # project's settings and hooks raise reaches ``_can_use_tool``, which
+        # puts it in front of the operator on a write-enabled render.
+        self._approvals = await asyncio.to_thread(_render_arms_writes)
         scope = AsyncExitStack()
         agent = await scope.enter_async_context(
             agent_session(
@@ -641,6 +733,7 @@ class OperatorSession:
                 resume=resume_id,
                 session_id=session_id,
                 await_mcp_servers=(),
+                can_use_tool=self._can_use_tool,
             )
         )
         self._agent = agent
@@ -648,25 +741,193 @@ class OperatorSession:
         self._started = True
         logger.info("OperatorSession started (cwd=%s)", self._cwd)
 
+    # ---- Operator approvals ---- #
+
+    async def _can_use_tool(self, tool_name: str, tool_input: dict[str, Any], context: Any) -> Any:
+        """Put one permission request in front of the operator and wait for the answer.
+
+        Called by the SDK for every tool use the project's settings and hooks
+        leave at ``ask``, and for every ``AskUserQuestion``. The request goes
+        out on the turn's stream as a ``permission_request`` frame; the turn
+        waits here until :meth:`resolve_permission` answers it, or until an
+        interrupt or teardown declines it.
+        """
+        is_question = tool_name == _QUESTION_TOOL
+        if not is_question and not self._approvals:
+            return PermissionResultDeny(
+                message="This deployment does not arm writes, so the operator cannot approve it."
+            )
+        request_id = uuid.uuid4().hex
+        future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        self._permissions[request_id] = (future, tool_input)
+        try:
+            await self._queue.put(
+                {
+                    "type": "permission_request",
+                    "request_id": request_id,
+                    "kind": "question" if is_question else "tool",
+                    "tool_name": _format_tool_name(tool_name),
+                    "tool_name_raw": tool_name,
+                    "tool_use_id": getattr(context, "tool_use_id", None),
+                    "input": tool_input,
+                    "reason": getattr(context, "decision_reason", None),
+                    "title": getattr(context, "title", None),
+                    "description": getattr(context, "description", None),
+                }
+            )
+            return await future
+        finally:
+            self._permissions.pop(request_id, None)
+
+    def resolve_permission(
+        self,
+        request_id: str,
+        *,
+        allow: bool,
+        answers: dict[str, str] | None = None,
+        message: str | None = None,
+    ) -> bool:
+        """Answer one pending permission request. False when nothing waits under *request_id*."""
+        pending = self._permissions.get(request_id)
+        if pending is None or pending[0].done():
+            return False
+        future, tool_input = pending
+        if not allow:
+            future.set_result(
+                PermissionResultDeny(message=message or "The operator declined this tool call.")
+            )
+        elif answers is not None:
+            future.set_result(
+                PermissionResultAllow(updated_input={**tool_input, "answers": answers})
+            )
+        else:
+            future.set_result(PermissionResultAllow())
+        return True
+
+    def _deny_pending(self) -> None:
+        """Decline every request still waiting, so a stop never leaves the SDK hanging."""
+        for future, _input in list(self._permissions.values()):
+            if not future.done():
+                future.set_result(
+                    PermissionResultDeny(message="The operator stopped the turn.", interrupt=True)
+                )
+
     async def send_prompt(self, prompt: str) -> None:
         """Send a prompt and start streaming the response into the queue."""
         agent = self._connected_agent
         if agent is None:
             raise RuntimeError("Session not started")
 
+        # A stopped turn may still be draining what the CLI says after it (a
+        # stopped background agent's follow-up). Two readers on one stream
+        # would hand that answer to this prompt, so let the drain finish first.
+        quiesce = self._quiesce_task
+        if quiesce is not None and not quiesce.done():
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(quiesce), timeout=_BACKGROUND_DRAIN_S + _QUIESCE_TIMEOUT_S
+                )
+            except Exception:
+                pass
+
+        # What the drain read belongs to the turn that was stopped, and nobody
+        # is reading it: left queued, its result would end this turn at once.
+        while not self._queue.empty():
+            self._queue.get_nowait()
         await agent.submit(prompt)
         self._response_task = asyncio.create_task(self._stream_response())
 
+    def _track_background(self, event: AgentEvent) -> dict[str, Any] | None:
+        """Follow the background agents this turn starts and the reports that end them.
+
+        An agent runs in the background when the model asks for it or when
+        its definition says so, and the input shows only the first; the call's
+        result is what says it went async, so that is what marks one open.
+
+        Returns an ``agent_done`` frame for the chat when *event* ends an agent
+        call, naming the call by its ``tool_use_id``; ``None`` otherwise.
+        """
+        if isinstance(event, ToolUseEvent):
+            if event.name in _AGENT_TOOLS:
+                self._agent_calls.add(event.tool_use_id)
+        elif isinstance(event, ToolResultEvent):
+            if event.tool_use_id in self._agent_calls and _ASYNC_LAUNCH_MARK in (event.text or ""):
+                self._background.add(event.tool_use_id)
+        elif isinstance(event, SystemEvent):
+            data = event.data
+            task_id = data.get("task_id")
+            if event.subtype == "task_started" and task_id and data.get("tool_use_id"):
+                self._task_calls[task_id] = data["tool_use_id"]
+            elif event.subtype == "task_notification" or (
+                event.subtype == "task_updated"
+                and (data.get("patch") or {}).get("status") in _TERMINAL_TASK_STATUSES
+            ):
+                call = data.get("tool_use_id") or self._task_calls.get(task_id or "")
+                if call in self._background:
+                    self._background.discard(call)
+                    status = data.get("status") or (data.get("patch") or {}).get("status")
+                    return {
+                        "type": "system",
+                        "subtype": "agent_done",
+                        "tool_use_id": call,
+                        "status": "stopped" if status == "killed" else status,
+                        "summary": data.get("summary", ""),
+                    }
+        return None
+
+    async def _stop_background(self) -> None:
+        """Stop the background agents still open, so none reports after a Stop."""
+        agent = self._connected_agent
+        if agent is None:
+            return
+        for task_id, call in list(self._task_calls.items()):
+            if call in self._background:
+                try:
+                    await agent.stop_task(task_id)
+                except Exception:
+                    logger.debug("Could not stop background task %s", task_id, exc_info=True)
+
     async def _stream_response(self) -> None:
-        """Iterate the turn's event records and push their frames to the queue."""
+        """Iterate the turn's event records and push their frames to the queue.
+
+        A turn that hands work to a background agent ends with a result while
+        the agent still runs, and the CLI answers with a turn of its own once
+        that agent reports. That answer belongs to this turn, so a result
+        arriving while a background agent is open is held back, the next
+        response is read, and only the result with none open ends the turn.
+        """
         agent = self._agent
+        self._background.clear()
+        self._agent_calls.clear()
+        self._task_calls.clear()
+        self._idle_wait = False
         try:
             if agent is None:
                 raise RuntimeError("Session not started")
-            async for event in agent.events():
-                frame = _event_to_wire(event)
-                if frame is not None:
+            while True:
+                saw_result = False
+                async for event in agent.events():
+                    done = self._track_background(event)
+                    if done is not None:
+                        await self._queue.put(done)
+                    if _main_agent_active(event):
+                        self._idle_wait = False
+                    frame = _event_to_wire(event)
+                    if frame is None:
+                        continue
+                    if frame["type"] == "result":
+                        saw_result = True
+                        if self._background:
+                            # The main agent is idle now, waiting on the report.
+                            self._idle_wait = True
+                            frame = {
+                                "type": "system",
+                                "subtype": "background_wait",
+                                "tasks": len(self._background),
+                            }
                     await self._queue.put(frame)
+                if not (saw_result and self._background):
+                    break
         except AgentRunError as exc:
             await self._queue.put(
                 {
@@ -686,8 +947,11 @@ class OperatorSession:
                 }
             )
         finally:
-            # Re-stamp at turn completion (normal, error, or cancellation).
+            # Re-stamp at turn completion (normal, error, or cancellation), and
+            # stop holding the turn's deadline open for agents nobody reads now.
             self.last_activity = time.monotonic()
+            self._background.clear()
+            self._idle_wait = False
 
     async def run_turn(
         self,
@@ -728,6 +992,11 @@ class OperatorSession:
 
             deadline = loop.time() + timeout_s
             while True:
+                if self._permissions or self._background:
+                    # An approval waits on the operator and a background agent
+                    # on its own work, not the SDK: the silence deadline does
+                    # not run while either is open.
+                    deadline = loop.time() + timeout_s
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     raise TurnSilenceTimeout("no SDK event before the turn deadline")
@@ -775,8 +1044,14 @@ class OperatorSession:
         Never drains the reader and never touches the turn guard — the consumer
         running the turn owns quiesce and release.
         """
+        self._deny_pending()
+        idle = self._idle_wait
+        await self._stop_background()
         agent = self._connected_agent
-        if agent is not None:
+        # Waiting on a background agent the main agent is idle: an interrupt
+        # there answers with a result of its own that would end the read
+        # before the stopped agent's follow-up arrives, so only the agent stops.
+        if agent is not None and not idle:
             await agent.interrupt()
 
     async def cancel(self) -> None:
@@ -791,13 +1066,19 @@ class OperatorSession:
            ``_QUIESCE_TIMEOUT_S`` seconds via ``asyncio.wait_for``.
         3. Hard-cancel the reader regardless of whether the drain completed.
         """
+        self._deny_pending()
         task = self._response_task
         if task is None or task.done():
             return
 
-        # 1. Interrupt the runner first so the CLI stops generating.
+        # 1. Stop any background agent, then interrupt the runner so the CLI
+        #    stops generating — unless the main agent is idle waiting on one
+        #    (see :meth:`interrupt`); then the drain reads the CLI's answer to
+        #    the stop, which can take a model turn, so it gets longer.
+        idle = self._idle_wait
+        await self._stop_background()
         agent = self._connected_agent
-        if agent is not None:
+        if agent is not None and not idle:
             try:
                 await agent.interrupt()
             except Exception:
@@ -806,8 +1087,9 @@ class OperatorSession:
         # 2. Drain toward the interrupt's terminal message, bounded. Shield so
         #    the timeout cancels only our wait, not the reader itself — the
         #    hard-cancel below owns that.
+        drain_s = _BACKGROUND_DRAIN_S if idle else _QUIESCE_TIMEOUT_S
         try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=_QUIESCE_TIMEOUT_S)
+            await asyncio.wait_for(asyncio.shield(task), timeout=drain_s)
         except TimeoutError:
             pass
         except asyncio.CancelledError:
