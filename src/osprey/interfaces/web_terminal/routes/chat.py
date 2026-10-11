@@ -7,6 +7,10 @@ POST /api/chat/{chat_id}/permission
 Body: {"request_id": "...", "allow": bool, "answers"?: {...}, "message"?: "..."}
 Answers a ``permission_request`` frame the in-flight turn is waiting on.
 
+GET /api/chat/{chat_id}/events
+A live SSE feed of every frame the chat's agent emits, opening with a ``hello``
+snapshot; how reloaded and second tabs follow a running turn.
+
 GET /api/chat/commands
 Answers {"commands": [{"name", "description", "argument_hint", "kind"}, ...]},
 the slash commands the chat agent accepts in this project.
@@ -97,12 +101,15 @@ class PermissionAnswer(BaseModel):
 
     ``answers`` (question text -> chosen label, several labels comma-joined)
     answers an ``AskUserQuestion``; for a tool approval it is omitted.
+    ``for_session`` allows the tool for the rest of the session, where the
+    request offered that (``can_allow_session``).
     """
 
     request_id: str
     allow: bool
     answers: dict[str, str] | None = None
     message: str | None = None
+    for_session: bool = False
 
 
 #: Longest string value of a tool input the chat client is sent. Inputs are
@@ -148,6 +155,7 @@ def _strip_for_chat(event: dict[str, Any]) -> dict[str, Any]:
             "type": "result",
             "is_error": event.get("is_error"),
             "duration_ms": event.get("duration_ms"),
+            "seq": event.get("seq"),
         }
 
     return event
@@ -353,8 +361,8 @@ async def _stream_events(
     except TurnSilenceTimeout:
         yield _sse(_strip_for_chat(_timeout_event()))
     except asyncio.CancelledError:
-        # Non-terminal: client disconnect / re-delivered cancellation. run_turn
-        # already quiesced + released; re-raise so Starlette sees the cancel.
+        # Non-terminal: client disconnect / re-delivered cancellation. The turn
+        # runs on as an orphan (see run_turn); re-raise so Starlette sees it.
         raise
     except Exception as exc:
         logger.exception("Chat stream error")
@@ -363,8 +371,7 @@ async def _stream_events(
             _strip_for_chat({"type": "error", "message": str(exc), "error_type": error_type})
         )
     finally:
-        if session.release_turn(token):
-            session.spawn_quiesce()
+        session.end_consumer(token)
 
 
 def _timeout_event() -> dict[str, Any]:
@@ -420,13 +427,12 @@ async def _buffered_response(
     except TurnSilenceTimeout:
         is_error, error_msg, status_code = True, "Timeout waiting for response", 504
     except asyncio.CancelledError:
-        # Abandoned request — run_turn already quiesced + released; re-raise so
-        # the server sees the cancellation.
+        # Abandoned request — the turn runs on as an orphan (see run_turn);
+        # re-raise so the server sees the cancellation.
         raise
     finally:
         # Safety net for the never-started case only (see _stream_events).
-        if session.release_turn(token):
-            session.spawn_quiesce()
+        session.end_consumer(token)
 
     payload: dict[str, Any] = {
         "text": "".join(text_parts),
@@ -440,16 +446,17 @@ async def _buffered_response(
 
 @router.post("/api/chat/{chat_id}/interrupt", status_code=204)
 async def interrupt_chat(chat_id: str, request: Request) -> Response:
-    """Signal-only interrupt of an in-flight streaming turn.
+    """Signal-only interrupt of whatever the chat's agent is doing.
 
-    Sends ``client.interrupt()`` iff a turn is currently in flight for
-    ``chat_id`` — nothing else. It never drains the reader and never releases
-    the turn guard; the handler running that turn owns quiesce and release. A
-    204 is returned whether or not there was anything to interrupt (idempotent).
+    A turn in flight, or a response the CLI started on its own — either can be
+    stopped from any tab. It never releases the turn guard; the turn's owner
+    (its consumer, or the pump for a turn whose tab went away) does that when
+    the interrupt's result arrives. A 204 is returned whether or not there was
+    anything to interrupt (idempotent).
     """
     registry = request.app.state.operator_registry
     session = registry.get_chat_session(chat_id)
-    if session is not None and session.in_flight:
+    if session is not None:
         try:
             await session.interrupt()
         except Exception:
@@ -468,8 +475,12 @@ async def answer_chat_permission(
     """
     registry = request.app.state.operator_registry
     session = registry.get_chat_session(chat_id)
-    if session is None or not session.resolve_permission(
-        body.request_id, allow=body.allow, answers=body.answers, message=body.message
+    if session is None or not await session.resolve_permission(
+        body.request_id,
+        allow=body.allow,
+        answers=body.answers,
+        message=body.message,
+        for_session=body.for_session,
     ):
         raise HTTPException(
             status_code=404,
@@ -479,6 +490,44 @@ async def answer_chat_permission(
             },
         )
     return Response(status_code=204)
+
+
+@router.get("/api/chat/{chat_id}/events")
+async def chat_events(chat_id: str, request: Request) -> Response:
+    """A live feed of everything the chat's agent does, for any tab bound to it.
+
+    Opens with a ``hello`` snapshot — whether a turn is running, its prompt,
+    and the permission requests waiting — then carries every frame the agent
+    emits, whichever tab asked: a reloaded tab picks a running turn back up,
+    a second tab follows it, and a response the CLI starts on its own is seen.
+    Frames carry ``seq``, so a tab that also holds the turn's own stream draws
+    each frame once. 404 ``no_chat`` while no agent runs for the chat yet; the
+    client subscribes again once its first prompt starts one.
+    """
+    registry = request.app.state.operator_registry
+    session = registry.get_chat_session(chat_id)
+    if session is None or not session.is_active:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "no_chat", "message": "No agent is running for this chat."},
+        )
+    feed, hello = session.subscribe()
+
+    async def stream():
+        try:
+            pending = [_strip_for_chat(frame) for frame in hello["pending"]]
+            yield _sse({**hello, "pending": pending})
+            while session.feed_open(feed):
+                try:
+                    frame = await asyncio.wait_for(feed.get(), timeout=HEARTBEAT_INTERVAL_S)
+                except TimeoutError:
+                    yield ": heartbeat\n\n"
+                    continue
+                yield _sse(_strip_for_chat(frame))
+        finally:
+            session.unsubscribe(feed)
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
 
 
 @router.delete("/api/chat/{chat_id}", status_code=204)

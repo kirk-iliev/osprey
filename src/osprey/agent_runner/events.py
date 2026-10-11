@@ -22,6 +22,7 @@ try:
     from claude_agent_sdk import (
         AssistantMessage,
         ResultMessage,
+        StreamEvent,
         SystemMessage,
         TextBlock,
         ThinkingBlock,
@@ -117,6 +118,20 @@ class ResultEvent:
     api_error_status: int | None
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DeltaEvent:
+    """A piece of assistant text or reasoning as it streams.
+
+    Produced only for a run opened with ``include_partial_messages``. The whole
+    block still arrives afterwards as a :class:`TextEvent` or
+    :class:`ThinkingEvent`, which is the authoritative copy.
+    """
+
+    kind: str  # "text" | "thinking"
+    text: str
+    parent_tool_use_id: str | None
+
+
 AgentEvent = (
     TextEvent
     | ThinkingEvent
@@ -125,7 +140,12 @@ AgentEvent = (
     | ApiErrorEvent
     | SystemEvent
     | ResultEvent
+    | DeltaEvent
 )
+
+#: Stream-event delta types the chat shows as they arrive, and the record kind
+#: and payload field each maps to.
+_DELTA_FIELDS = {"text_delta": ("text", "text"), "thinking_delta": ("thinking", "thinking")}
 
 
 def _tool_block_event(block: object, parent_tool_use_id: str | None) -> AgentEvent | None:
@@ -156,8 +176,9 @@ def translate_message(message: object) -> list[AgentEvent]:
     blocks; its text and thinking blocks, and a user message whose content is a
     plain string, yield nothing. Every system message, subclasses included,
     yields one :class:`SystemEvent`; the result message yields one
-    :class:`ResultEvent`. Anything else — partial stream events, rate-limit
-    notices, an unknown type — yields nothing.
+    :class:`ResultEvent`. A partial stream event yields one :class:`DeltaEvent`
+    when it is a text or thinking delta. Anything else — other stream events,
+    rate-limit notices, an unknown type — yields nothing.
 
     Args:
         message: One message from the SDK's response stream.
@@ -204,4 +225,15 @@ def translate_message(message: object) -> list[AgentEvent]:
                 api_error_status=message.api_error_status,
             )
         )
+    elif isinstance(message, StreamEvent):
+        raw = message.event if isinstance(message.event, dict) else {}
+        delta = raw.get("delta") if raw.get("type") == "content_block_delta" else None
+        mapping = _DELTA_FIELDS.get(delta.get("type", "")) if isinstance(delta, dict) else None
+        if mapping is not None:
+            kind, field = mapping
+            piece = delta.get(field)
+            if isinstance(piece, str) and piece:
+                events.append(
+                    DeltaEvent(kind=kind, text=piece, parent_tool_use_id=message.parent_tool_use_id)
+                )
     return events

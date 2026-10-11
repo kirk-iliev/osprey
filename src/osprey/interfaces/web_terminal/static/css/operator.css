@@ -901,6 +901,16 @@ html[data-ui-mode="simple"] #operator-container {
   overflow-wrap: anywhere;
 }
 
+/* The plan the agent wants to carry out, read as markdown inside the card. */
+.op-card-plan {
+  max-height: 360px;
+  overflow: auto;
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg-elevated);
+  border-radius: var(--radius-lg);
+  font-size: var(--text-md);
+}
+
 .op-card-error {
   margin: 0;
   font-size: var(--text-md);
@@ -1261,6 +1271,15 @@ html[data-ui-mode="simple"] #operator-container {
   flex: 1;
   height: 1px;
   background: var(--border-default);
+}
+
+/* A notice from the CLI (the conversation was compacted): one muted line. */
+.op-notice {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-md);
+  color: var(--text-muted);
 }
 
 /* ---- Live loader: the turn's status line ---- */

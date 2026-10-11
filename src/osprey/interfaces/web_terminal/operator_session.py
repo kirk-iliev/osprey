@@ -14,7 +14,7 @@ import time
 import uuid
 from collections.abc import Callable
 from contextlib import AsyncExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -25,6 +25,7 @@ from osprey.agent_runner import (
     AgentRunError,
     AgentSession,
     ApiErrorEvent,
+    DeltaEvent,
     ResultEvent,
     SystemEvent,
     TextEvent,
@@ -37,6 +38,7 @@ from osprey.agent_runner.clean_env import build_clean_env
 from osprey.agent_runner.sdk_context import (
     PermissionResultAllow,
     PermissionResultDeny,
+    PermissionUpdate,
     build_system_prompt,
 )
 from osprey.audit.posture import OSPREY_AGENT_DATA_ROOT
@@ -274,6 +276,25 @@ _BACKGROUND_DRAIN_S = 30.0
 #: tool approval: the answer goes back as ``answers`` in the tool's input.
 _QUESTION_TOOL = "AskUserQuestion"
 
+#: The tool the agent calls to leave plan mode; its request is the plan, for
+#: the operator to approve or send back. Like a question, it is not a write.
+_PLAN_TOOL = "ExitPlanMode"
+
+#: Tool families that act on the machine. Their approvals are per call, always:
+#: "Allow for this session" is never offered for them.
+_NO_STANDING_APPROVAL_PREFIXES = ("mcp__controls__", "mcp__bluesky__", "mcp__python__")
+
+#: How many frames a feed may fall behind before it is dropped; a dropped feed
+#: reconnects and starts again from a snapshot.
+_SUBSCRIBER_BUFFER = 2000
+
+#: What approving a plan applies: back to the default mode, for this session.
+_LEAVE_PLAN_MODE = (
+    [PermissionUpdate(type="setMode", mode="default", destination="session")]
+    if PermissionUpdate is not None
+    else None
+)
+
 #: How much of a tool's result the chat stream carries — enough for a chip's
 #: preview line, never a whole file or archiver dump.
 _TOOL_RESULT_PREVIEW_CHARS = 600
@@ -314,19 +335,74 @@ def _main_agent_active(event: AgentEvent) -> bool:
     return isinstance(event, SystemEvent) and event.subtype == "init"
 
 
+def _starts_response(event: AgentEvent) -> bool:
+    """Whether *event* means the CLI is answering something, not just reporting.
+
+    A response opens with the ``init`` notice and carries the agent's records.
+    The CLI's other notices — the SessionStart hooks it runs before any
+    prompt, task progress, … — say nothing about a response being under way;
+    counting them would park the next prompt behind a response that is not
+    coming.
+    """
+    if isinstance(event, SystemEvent):
+        return event.subtype == "init"
+    return not isinstance(event, ResultEvent)
+
+
+#: How many responses in a row the CLI may produce with no prompt behind them
+#: before the pump stops reading. The CLI answers on its own only after a
+#: background agent reports; a run of them means the stream is broken, and
+#: reading on would spin and keep every one of them in memory.
+_MAX_UNPROMPTED_RESPONSES = 20
+
+
+@dataclass
+class _PendingAsk:
+    """One permission request waiting on the operator."""
+
+    future: asyncio.Future[Any]
+    tool_input: dict[str, Any]
+    #: The ``permission_request`` frame, so a tab that joins late is shown it.
+    frame: dict[str, Any]
+    #: The rules "Allow for this session" adds; empty when it is not offered.
+    standing: list[Any]
+
+
+def _standing_rules(tool_name: str, suggestions: list[Any]) -> list[Any]:
+    """The CLI's suggested allow rules for *tool_name*, scoped to this session only.
+
+    Never for a tool that acts on the machine, and never saved: a suggestion
+    aimed at the project's or the user's settings is narrowed to the session,
+    so nothing an operator clicks in the chat outlives it.
+    """
+    if tool_name.startswith(_NO_STANDING_APPROVAL_PREFIXES):
+        return []
+    return [
+        replace(s, destination="session")
+        for s in suggestions
+        if getattr(s, "type", None) in ("addRules", "replaceRules")
+        and getattr(s, "behavior", None) == "allow"
+    ]
+
+
 def _format_tool_name(raw: str) -> str:
     """Convert raw tool name to a human-readable display name.
 
     Strips ``mcp__<server>__`` prefix and title-cases the remainder,
-    replacing underscores with spaces.
+    replacing underscores with spaces; a built-in's CamelCase name is split
+    into its words.
 
     Examples:
         >>> _format_tool_name("mcp__osprey__channel_read")
         'Channel Read'
         >>> _format_tool_name("Read")
         'Read'
+        >>> _format_tool_name("ToolSearch")
+        'Tool Search'
     """
     name = _MCP_PREFIX_RE.sub("", raw)
+    if "_" not in name and name[:1].isupper():
+        return re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", name)
     return name.replace("_", " ").title()
 
 
@@ -388,6 +464,7 @@ def _event_to_wire(event: AgentEvent) -> dict[str, Any] | None:
         session_id = event.data.get("session_id")
         if session_id:
             frame["session_id"] = session_id
+        frame.update(_notice_fields(event))
         return frame
     if isinstance(event, ToolResultEvent):
         text = event.text or ""
@@ -398,8 +475,36 @@ def _event_to_wire(event: AgentEvent) -> dict[str, Any] | None:
             "preview": text[:_TOOL_RESULT_PREVIEW_CHARS],
             "truncated": len(text) > _TOOL_RESULT_PREVIEW_CHARS,
         }
-    # Any other record (stream deltas, rate-limit notices) stays off the stream.
+    if isinstance(event, DeltaEvent):
+        return {
+            "type": "delta",
+            "kind": event.kind,
+            "content": event.text,
+            "parent_tool_use_id": event.parent_tool_use_id,
+        }
+    # Any other record (rate-limit notices, …) stays off the stream.
     return None
+
+
+def _notice_fields(event: SystemEvent) -> dict[str, Any]:
+    """The fields the chat shows for a CLI notice: compaction, API retries, status.
+
+    ``compact_boundary`` says the conversation was summarised (what started it
+    and how many tokens it had); ``api_retry`` that a request failed and is being
+    retried; ``status`` what the CLI is doing now (``compacting``, or nothing).
+    """
+    data = event.data
+    if event.subtype == "compact_boundary":
+        meta = data.get("compact_metadata") or data.get("compactMetadata") or {}
+        return {"trigger": meta.get("trigger"), "pre_tokens": meta.get("pre_tokens")}
+    if event.subtype == "api_retry":
+        return {
+            key: data.get(key)
+            for key in ("attempt", "max_retries", "retry_delay_ms", "error_status")
+        }
+    if event.subtype == "status":
+        return {"status": data.get("status")}
+    return {}
 
 
 def validate_project_directory(cwd: str) -> list[str]:
@@ -573,9 +678,33 @@ class OperatorSession:
         # What the last stop that found a live child did about what it started.
         self._tree_ending: TreeEnding | None = None
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=256)
-        self._response_task: asyncio.Task | None = None
         self._quiesce_task: asyncio.Task | None = None
         self._started = False
+        # The one reader of the agent's stream, for the life of the session
+        # (see ``_pump``), and where what it reads goes. ``_turn_open``: the
+        # response being read answers a submitted prompt, so it goes to the
+        # turn's consumer. ``_pending_turn``: a prompt arrived while the CLI was
+        # mid-way through a response of its own; its turn opens when that one
+        # ends. ``_in_response``: the pump has read a record since the last
+        # result. ``_turn_closed`` is set whenever no turn is open.
+        self._pump_task: asyncio.Task | None = None
+        self._turn_open = False
+        self._pending_turn = False
+        self._in_response = False
+        self._turn_prompt: str | None = None
+        self._turn_closed = asyncio.Event()
+        self._turn_closed.set()
+        # A turn whose consumer went away (the tab closed or reloaded) runs on;
+        # its guard is held here and released when the turn ends.
+        self._orphan_token: int | None = None
+        # Tokens whose run_turn is reading the queue right now.
+        self._consumers: set[int] = set()
+        # Responses in a row the CLI produced with no prompt behind them.
+        self._unprompted = 0
+        # Live feeds of every frame (``subscribe``), and the frame counter
+        # that lets a client holding two streams draw each frame once.
+        self._subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
+        self._seq = 0
         # Per-turn one-in-flight guard. ``_turn_epoch`` only ever increments and
         # names each turn ever started; ``_active_token`` holds the current
         # turn's epoch or None when idle. Manipulated only by the synchronous,
@@ -587,11 +716,10 @@ class OperatorSession:
         # creation and re-stamped when a turn's reader completes; the chat
         # registry (issue: chat-registry) uses it as its idle predicate.
         self.last_activity = time.monotonic()
-        # Permission requests waiting on the operator: request id -> (answer
-        # future, the tool input the request was made with). Filled by
+        # Permission requests waiting on the operator, by request id. Filled by
         # ``_can_use_tool``; drained by ``resolve_permission`` or, on interrupt
         # and teardown, by ``_deny_pending``.
-        self._permissions: dict[str, tuple[asyncio.Future[Any], dict[str, Any]]] = {}
+        self._permissions: dict[str, _PendingAsk] = {}
         # Whether tool approvals are offered at all; read from the render at start.
         self._approvals = False
         # Background agents the current turn launched and that have not yet
@@ -645,17 +773,17 @@ class OperatorSession:
     def is_busy(self) -> bool:
         """True while the session is genuinely working.
 
-        Busy = the per-turn guard is held AND its reader or a quiesce task is
-        still running. A *zombie* — guard held but both the reader and quiesce
-        already done — is NOT busy, so pools may evict/reap it.
+        Busy = the per-turn guard is held AND a turn is open (or waiting to
+        open) on a live pump, or a quiesce is still running. A *zombie* — guard
+        held but nothing reading — is NOT busy, so pools may evict/reap it.
         """
         if not self.in_flight:
             return False
-        handler = self._response_task
+        pump = self._pump_task
         quiesce = self._quiesce_task
-        handler_running = handler is not None and not handler.done()
+        pump_running = pump is not None and not pump.done()
         quiesce_running = quiesce is not None and not quiesce.done()
-        return handler_running or quiesce_running
+        return (pump_running and (self._turn_open or self._pending_turn)) or quiesce_running
 
     async def start(self, *, resume_id: str | None = None) -> None:
         """Open the conversation on the shared agent runner.
@@ -734,11 +862,13 @@ class OperatorSession:
                 session_id=session_id,
                 await_mcp_servers=(),
                 can_use_tool=self._can_use_tool,
+                include_partial_messages=True,
             )
         )
         self._agent = agent
         self._agent_scope = scope
         self._started = True
+        self._pump_task = asyncio.create_task(self._pump())
         logger.info("OperatorSession started (cwd=%s)", self._cwd)
 
     # ---- Operator approvals ---- #
@@ -747,80 +877,172 @@ class OperatorSession:
         """Put one permission request in front of the operator and wait for the answer.
 
         Called by the SDK for every tool use the project's settings and hooks
-        leave at ``ask``, and for every ``AskUserQuestion``. The request goes
-        out on the turn's stream as a ``permission_request`` frame; the turn
-        waits here until :meth:`resolve_permission` answers it, or until an
-        interrupt or teardown declines it.
+        leave at ``ask``, for every ``AskUserQuestion`` and for ``ExitPlanMode``.
+        The request goes out on the turn's stream and every feed as a
+        ``permission_request`` frame; the turn waits here until
+        :meth:`resolve_permission` answers it, or until an interrupt or
+        teardown declines it.
         """
-        is_question = tool_name == _QUESTION_TOOL
-        if not is_question and not self._approvals:
+        kind = {_QUESTION_TOOL: "question", _PLAN_TOOL: "plan"}.get(tool_name, "tool")
+        if kind == "tool" and not self._approvals:
             return PermissionResultDeny(
                 message="This deployment does not arm writes, so the operator cannot approve it."
             )
+        standing = _standing_rules(tool_name, getattr(context, "suggestions", None) or [])
         request_id = uuid.uuid4().hex
+        frame = {
+            "type": "permission_request",
+            "request_id": request_id,
+            "kind": kind,
+            "tool_name": _format_tool_name(tool_name),
+            "tool_name_raw": tool_name,
+            "tool_use_id": getattr(context, "tool_use_id", None),
+            "input": tool_input,
+            "reason": getattr(context, "decision_reason", None),
+            "title": getattr(context, "title", None),
+            "description": getattr(context, "description", None),
+            # Whether "Allow for this session" is offered (see _standing_rules).
+            "can_allow_session": bool(standing),
+        }
         future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
-        self._permissions[request_id] = (future, tool_input)
+        self._permissions[request_id] = _PendingAsk(future, tool_input, frame, standing)
         try:
-            await self._queue.put(
-                {
-                    "type": "permission_request",
-                    "request_id": request_id,
-                    "kind": "question" if is_question else "tool",
-                    "tool_name": _format_tool_name(tool_name),
-                    "tool_name_raw": tool_name,
-                    "tool_use_id": getattr(context, "tool_use_id", None),
-                    "input": tool_input,
-                    "reason": getattr(context, "decision_reason", None),
-                    "title": getattr(context, "title", None),
-                    "description": getattr(context, "description", None),
-                }
-            )
+            await self._emit(frame)
             return await future
         finally:
             self._permissions.pop(request_id, None)
 
-    def resolve_permission(
+    async def resolve_permission(
         self,
         request_id: str,
         *,
         allow: bool,
         answers: dict[str, str] | None = None,
         message: str | None = None,
+        for_session: bool = False,
     ) -> bool:
-        """Answer one pending permission request. False when nothing waits under *request_id*."""
+        """Answer one pending permission request. False when nothing waits under *request_id*.
+
+        ``for_session`` also adds the CLI's suggested allow rules for the rest
+        of this session — only where the request offered it. Every tab is told
+        the request was answered, so a card open in another one settles too.
+        """
         pending = self._permissions.get(request_id)
-        if pending is None or pending[0].done():
+        if pending is None or pending.future.done():
             return False
-        future, tool_input = pending
         if not allow:
-            future.set_result(
-                PermissionResultDeny(message=message or "The operator declined this tool call.")
+            result: Any = PermissionResultDeny(
+                message=message
+                or (
+                    "The operator wants to keep planning."
+                    if pending.frame["kind"] == "plan"
+                    else "The operator declined this tool call."
+                )
             )
         elif answers is not None:
-            future.set_result(
-                PermissionResultAllow(updated_input={**tool_input, "answers": answers})
-            )
+            result = PermissionResultAllow(updated_input={**pending.tool_input, "answers": answers})
+        elif pending.frame["kind"] == "plan":
+            # Approving the plan leaves plan mode for the default one, where
+            # every write still asks.
+            result = PermissionResultAllow(updated_permissions=_LEAVE_PLAN_MODE)
+        elif for_session and pending.standing:
+            result = PermissionResultAllow(updated_permissions=pending.standing)
         else:
-            future.set_result(PermissionResultAllow())
+            result = PermissionResultAllow()
+        pending.future.set_result(result)
+        await self._emit(
+            {
+                "type": "permission_resolved",
+                "request_id": request_id,
+                "allow": allow,
+                "for_session": bool(allow and for_session and pending.standing),
+                "answers": answers,
+            }
+        )
         return True
 
     def _deny_pending(self) -> None:
         """Decline every request still waiting, so a stop never leaves the SDK hanging."""
-        for future, _input in list(self._permissions.values()):
-            if not future.done():
-                future.set_result(
+        for pending in list(self._permissions.values()):
+            if not pending.future.done():
+                pending.future.set_result(
                     PermissionResultDeny(message="The operator stopped the turn.", interrupt=True)
                 )
 
+    # ---- Frame fan-out ---- #
+
+    def subscribe(self) -> tuple[asyncio.Queue[dict[str, Any]], dict[str, Any]]:
+        """Open a live feed of every frame this session emits, and the snapshot it starts from.
+
+        The snapshot (a ``hello`` frame) says whether a turn is running, what it
+        was asked, and which permission requests are waiting, so a tab that
+        opens mid-turn can show the turn and answer its cards.
+        """
+        feed: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=_SUBSCRIBER_BUFFER)
+        self._subscribers.add(feed)
+        hello = {
+            "type": "hello",
+            "seq": self._seq,
+            "in_flight": self._turn_open or self._pending_turn,
+            "prompt": self._turn_prompt,
+            "pending": [pending.frame for pending in self._permissions.values()],
+        }
+        return feed, hello
+
+    def unsubscribe(self, feed: asyncio.Queue[dict[str, Any]]) -> None:
+        """Close a feed opened by :meth:`subscribe`."""
+        self._subscribers.discard(feed)
+
+    def feed_open(self, feed: asyncio.Queue[dict[str, Any]]) -> bool:
+        """False once *feed* fell too far behind and was dropped, or the session stopped."""
+        return feed in self._subscribers and self.is_active
+
+    async def _emit(self, frame: dict[str, Any]) -> None:
+        """Number *frame*, hand it to every feed, and to the turn's consumer while it reads."""
+        self._seq += 1
+        frame = {**frame, "seq": self._seq}
+        for feed in list(self._subscribers):
+            try:
+                feed.put_nowait(frame)
+            except asyncio.QueueFull:
+                self._subscribers.discard(feed)
+        # Only a reading consumer gets the queue: one that is gone would leave
+        # it to fill, and the pump would stall on a full queue.
+        if self._turn_open and self._consumers and self._orphan_token is None:
+            await self._queue.put(frame)
+
+    # ---- Turn lifecycle ---- #
+
+    async def _open_turn(self, prompt: str | None) -> None:
+        """Route the responses from here on to the turn's consumer, and announce the turn."""
+        self._turn_open = True
+        self._turn_closed.clear()
+        self._background.clear()
+        self._agent_calls.clear()
+        self._task_calls.clear()
+        self._idle_wait = False
+        await self._emit({"type": "turn_start", "prompt": prompt})
+
+    def _close_turn(self) -> None:
+        """The open turn is over: stop routing to its consumer and free its guard if orphaned."""
+        self._turn_open = False
+        self._turn_prompt = None
+        self._background.clear()
+        self._idle_wait = False
+        self.last_activity = time.monotonic()
+        if self._orphan_token is not None:
+            self.release_turn(self._orphan_token)
+            self._orphan_token = None
+        self._turn_closed.set()
+
     async def send_prompt(self, prompt: str) -> None:
-        """Send a prompt and start streaming the response into the queue."""
+        """Send a prompt; its response reaches the queue through :meth:`_pump`."""
         agent = self._connected_agent
         if agent is None:
             raise RuntimeError("Session not started")
 
-        # A stopped turn may still be draining what the CLI says after it (a
-        # stopped background agent's follow-up). Two readers on one stream
-        # would hand that answer to this prompt, so let the drain finish first.
+        # A stopped turn may still be finishing (its quiesce waits for its
+        # result); the new turn starts after it, never alongside it.
         quiesce = self._quiesce_task
         if quiesce is not None and not quiesce.done():
             try:
@@ -830,12 +1052,25 @@ class OperatorSession:
             except Exception:
                 pass
 
-        # What the drain read belongs to the turn that was stopped, and nobody
-        # is reading it: left queued, its result would end this turn at once.
+        # Frames queued for a consumer that is gone belong to an earlier turn:
+        # left queued, its result would end this turn at once.
         while not self._queue.empty():
             self._queue.get_nowait()
-        await agent.submit(prompt)
-        self._response_task = asyncio.create_task(self._stream_response())
+        self._turn_prompt = prompt
+        self._unprompted = 0
+        if self._in_response:
+            # The CLI is mid-way through a response of its own and reads this
+            # prompt after it, so this turn opens when that response ends.
+            self._pending_turn = True
+            self._turn_closed.clear()
+        else:
+            await self._open_turn(prompt)
+        try:
+            await agent.submit(prompt)
+        except BaseException:
+            self._pending_turn = False
+            self._close_turn()
+            raise
 
     def _track_background(self, event: AgentEvent) -> dict[str, Any] | None:
         """Follow the background agents this turn starts and the reports that end them.
@@ -887,29 +1122,36 @@ class OperatorSession:
                 except Exception:
                     logger.debug("Could not stop background task %s", task_id, exc_info=True)
 
-    async def _stream_response(self) -> None:
-        """Iterate the turn's event records and push their frames to the queue.
+    async def _pump(self) -> None:
+        """Read the agent's stream for the life of the session and route every frame.
 
-        A turn that hands work to a background agent ends with a result while
-        the agent still runs, and the CLI answers with a turn of its own once
-        that agent reports. That answer belongs to this turn, so a result
-        arriving while a background agent is open is held back, the next
-        response is read, and only the result with none open ends the turn.
+        One reader, always reading. A response to a submitted prompt goes to
+        the turn's consumer and to every feed; a response the CLI produces on
+        its own (a background agent's follow-up after a Stop, …) goes to the
+        feeds alone, announced by a ``turn_start`` with no prompt. A turn that
+        hands work to a background agent stays open past that response's result
+        until the agent reports, and the next response is read into it.
         """
         agent = self._agent
-        self._background.clear()
-        self._agent_calls.clear()
-        self._task_calls.clear()
-        self._idle_wait = False
+        ended: dict[str, Any] = {
+            "type": "error",
+            "message": "The agent process ended.",
+            "error_type": "AgentExited",
+        }
         try:
             if agent is None:
                 raise RuntimeError("Session not started")
             while True:
                 saw_result = False
                 async for event in agent.events():
+                    if not self._in_response and _starts_response(event):
+                        self._in_response = True
+                        if not self._turn_open:
+                            self._unprompted += 1
+                            await self._emit({"type": "turn_start", "prompt": None})
                     done = self._track_background(event)
                     if done is not None:
-                        await self._queue.put(done)
+                        await self._emit(done)
                     if _main_agent_active(event):
                         self._idle_wait = False
                     frame = _event_to_wire(event)
@@ -917,7 +1159,8 @@ class OperatorSession:
                         continue
                     if frame["type"] == "result":
                         saw_result = True
-                        if self._background:
+                        self._in_response = False
+                        if self._background and self._turn_open:
                             # The main agent is idle now, waiting on the report.
                             self._idle_wait = True
                             frame = {
@@ -925,33 +1168,46 @@ class OperatorSession:
                                 "subtype": "background_wait",
                                 "tasks": len(self._background),
                             }
-                    await self._queue.put(frame)
-                if not (saw_result and self._background):
+                    await self._emit(frame)
+                    if is_terminal_event(frame):
+                        await self._end_response()
+                if not saw_result:
+                    break  # the stream closed without a result: the child is gone
+                if self._unprompted > _MAX_UNPROMPTED_RESPONSES:
+                    logger.error(
+                        "Chat %s: %d responses with no prompt; no longer reading its stream",
+                        self._session_key,
+                        self._unprompted,
+                    )
                     break
-        except AgentRunError as exc:
-            await self._queue.put(
-                {
-                    "type": "error",
-                    "message": str(exc),
-                    "error_type": exc.error_type,
-                }
-            )
+                # Give the loop back between responses, whatever the stream does.
+                await asyncio.sleep(0)
         except asyncio.CancelledError:
             raise
+        except AgentRunError as exc:
+            ended = {"type": "error", "message": str(exc), "error_type": exc.error_type}
         except Exception as exc:
-            await self._queue.put(
-                {
-                    "type": "error",
-                    "message": f"Unexpected error: {exc}",
-                    "error_type": type(exc).__name__,
-                }
-            )
-        finally:
-            # Re-stamp at turn completion (normal, error, or cancellation), and
-            # stop holding the turn's deadline open for agents nobody reads now.
-            self.last_activity = time.monotonic()
-            self._background.clear()
-            self._idle_wait = False
+            ended = {
+                "type": "error",
+                "message": f"Unexpected error: {exc}",
+                "error_type": type(exc).__name__,
+            }
+        self._in_response = False
+        if self._turn_open or self._pending_turn:
+            self._pending_turn = False
+            self._turn_open = True
+            await self._emit(ended)
+            self._close_turn()
+
+    async def _end_response(self) -> None:
+        """A terminal frame went out: close the open turn, and open the one waiting behind it."""
+        self._in_response = False
+        self.last_activity = time.monotonic()
+        if self._turn_open:
+            self._close_turn()
+        if self._pending_turn:
+            self._pending_turn = False
+            await self._open_turn(self._turn_prompt)
 
     async def run_turn(
         self,
@@ -961,41 +1217,48 @@ class OperatorSession:
         timeout_s: float,
         heartbeat_s: float = 15.0,
     ):
-        """Run one turn as an async generator: the sole queue consumer.
+        """Run one turn as an async generator: the turn's consumer.
 
-        Sends *prompt*, then yields every SDK event for the turn. While no event
+        Sends *prompt*, then yields every frame of the turn. While no frame
         arrives for ``heartbeat_s``, a ``{"type": "heartbeat"}`` marker is
         yielded so a streaming consumer can keep its transport alive (buffered
-        consumers just skip it — the marker never carries payload). ``keepalive``
-        queue events are consumed silently. The deadline is SDK-silence based:
-        it resets on every event; a lapse of ``timeout_s`` without any event
+        consumers just skip it — the marker never carries payload). The
+        deadline is SDK-silence based: it resets on every frame, and does not
+        run while an approval or a background agent is open or the turn waits
+        for a response of the CLI's own to end; a lapse of ``timeout_s``
         raises :class:`TurnSilenceTimeout`.
 
         Owns the turn from just after :meth:`acquire_turn` (done by the caller,
         which needs the 409 mapping before a response starts) through release:
 
-        * terminal event (see :func:`is_terminal_event`) — the guard is released
-          before the event is yielded, and the generator then returns;
-        * any other exit (silence timeout, consumer abandon/``GeneratorExit``,
-          cancellation, error) — a detached quiesce is spawned FIRST, then the
-          guard is released in a nested ``finally``.
+        * terminal frame (see :func:`is_terminal_event`) — the guard is
+          released before the frame is yielded, and the generator then returns;
+        * the consumer goes away (``GeneratorExit``, cancellation) after the
+          prompt was sent — the turn runs on: its guard is held as an orphan
+          and released by the pump when the turn ends, and its frames still
+          reach every feed, so a reloaded or second tab can follow it;
+        * anything else (silence timeout, an error) — a detached quiesce is
+          spawned FIRST, then the guard is released in a nested ``finally``.
 
         Callers must guard the never-started case (a generator that is closed
-        before its first ``__anext__`` never runs this body): after consuming,
-        ``if session.release_turn(token): session.spawn_quiesce()`` — both calls
-        are synchronous, so the pair cannot be interleaved by the event loop.
+        before its first ``__anext__`` never runs this body) with
+        :meth:`end_consumer`.
         """
         terminal_seen = False
+        submitted = False
+        consumer_gone = False
+        self._consumers.add(token)
         loop = asyncio.get_running_loop()
         try:
             await self.send_prompt(prompt)
+            submitted = True
 
             deadline = loop.time() + timeout_s
             while True:
-                if self._permissions or self._background:
-                    # An approval waits on the operator and a background agent
-                    # on its own work, not the SDK: the silence deadline does
-                    # not run while either is open.
+                if self._permissions or self._background or self._pending_turn:
+                    # An approval waits on the operator, a background agent on
+                    # its own work, a pending turn on the CLI's own response —
+                    # not on the SDK: the silence deadline does not run.
                     deadline = loop.time() + timeout_s
                 remaining = deadline - loop.time()
                 if remaining <= 0:
@@ -1026,8 +1289,18 @@ class OperatorSession:
                 yield event
                 if terminal_seen:
                     return
+        except (GeneratorExit, asyncio.CancelledError):
+            consumer_gone = True
+            raise
         finally:
+            self._consumers.discard(token)
             if terminal_seen:
+                self.release_turn(token)
+            elif consumer_gone and submitted and (self._turn_open or self._pending_turn):
+                # The tab went away; the turn does not. The pump frees the
+                # guard when the turn ends (see _close_turn).
+                self._orphan_token = token
+            elif not submitted:
                 self.release_turn(token)
             else:
                 # Spawn the detached quiesce FIRST, then release in a nested
@@ -1038,43 +1311,54 @@ class OperatorSession:
                 finally:
                     self.release_turn(token)
 
+    def end_consumer(self, token: int) -> None:
+        """The route that acquired *token* is done with it.
+
+        Frees a guard whose :meth:`run_turn` never ran (the consumer closed
+        before it started), and leaves alone one that run_turn released or
+        handed to a running turn as an orphan.
+        """
+        if token in self._consumers or token == self._orphan_token:
+            return
+        self.release_turn(token)
+
     async def interrupt(self) -> None:
         """Signal-only interrupt: forward the runner's interrupt if connected.
 
-        Never drains the reader and never touches the turn guard — the consumer
-        running the turn owns quiesce and release.
+        Never touches the turn guard — the pump closes the turn when the
+        interrupt's result arrives, and whoever holds the guard releases it.
         """
         self._deny_pending()
         idle = self._idle_wait
         await self._stop_background()
         agent = self._connected_agent
         # Waiting on a background agent the main agent is idle: an interrupt
-        # there answers with a result of its own that would end the read
-        # before the stopped agent's follow-up arrives, so only the agent stops.
-        if agent is not None and not idle:
+        # there answers with a result of its own that would end the turn before
+        # the stopped agent's follow-up arrives, so only the agent stops. With
+        # nothing running there is nothing to interrupt either.
+        working = self._turn_open or self._pending_turn or self._in_response
+        if agent is not None and working and not idle:
             await agent.interrupt()
 
     async def cancel(self) -> None:
-        """Interrupt the in-flight turn and quiesce the reader.
+        """Interrupt the in-flight turn and wait for it to end.
 
-        No-op short-circuit when there is no in-flight turn — ``_response_task``
-        is ``None`` or already done — so an idle cancel never hangs. Otherwise:
+        No-op short-circuit when nothing is running, so an idle cancel never
+        hangs. Otherwise:
 
-        1. Await the runner's interrupt FIRST so the CLI stops generating:
-           a discarded interrupt coroutine would leave the CLI running.
-        2. Drain toward the interrupt's terminal message, bounded at
-           ``_QUIESCE_TIMEOUT_S`` seconds via ``asyncio.wait_for``.
-        3. Hard-cancel the reader regardless of whether the drain completed.
+        1. Stop any background agent, then await the runner's interrupt so the
+           CLI stops generating — unless the main agent is idle waiting on a
+           background agent; then only that agent stops (see :meth:`interrupt`).
+        2. Wait for the turn to end, bounded at ``_QUIESCE_TIMEOUT_S`` (or
+           ``_BACKGROUND_DRAIN_S`` when the CLI answers the stop with a model
+           turn of its own).
+        3. A turn that has not ended by then is abandoned: its consumer is
+           told, and whatever it still says reaches the feeds alone.
         """
         self._deny_pending()
-        task = self._response_task
-        if task is None or task.done():
+        if not (self._turn_open or self._pending_turn or self._in_response):
             return
 
-        # 1. Stop any background agent, then interrupt the runner so the CLI
-        #    stops generating — unless the main agent is idle waiting on one
-        #    (see :meth:`interrupt`); then the drain reads the CLI's answer to
-        #    the stop, which can take a model turn, so it gets longer.
         idle = self._idle_wait
         await self._stop_background()
         agent = self._connected_agent
@@ -1084,26 +1368,23 @@ class OperatorSession:
             except Exception:
                 pass
 
-        # 2. Drain toward the interrupt's terminal message, bounded. Shield so
-        #    the timeout cancels only our wait, not the reader itself — the
-        #    hard-cancel below owns that.
+        if not (self._turn_open or self._pending_turn):
+            return
         drain_s = _BACKGROUND_DRAIN_S if idle else _QUIESCE_TIMEOUT_S
         try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=drain_s)
+            await asyncio.wait_for(self._turn_closed.wait(), timeout=drain_s)
         except TimeoutError:
-            pass
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            pass
-
-        # 3. Hard-cancel the reader regardless of the drain's outcome.
-        if not task.done():
-            task.cancel()
-        try:
-            await task
-        except (asyncio.CancelledError, Exception):
-            pass
+            if self._turn_open or self._pending_turn:
+                self._pending_turn = False
+                self._turn_open = True
+                await self._emit(
+                    {
+                        "type": "error",
+                        "message": "The turn did not stop in time and was abandoned.",
+                        "error_type": "TurnAbandoned",
+                    }
+                )
+                self._close_turn()
 
     def spawn_quiesce(self) -> asyncio.Task:
         """Spawn a detached task that quiesces the in-flight turn.
@@ -1162,6 +1443,13 @@ class OperatorSession:
         again rather than merely re-read its status.
         """
         await self.cancel()
+        pump = self._pump_task
+        if pump is not None and not pump.done():
+            pump.cancel()
+            try:
+                await pump
+            except (asyncio.CancelledError, Exception):
+                pass
 
         # Read while the child is alive and before the runner closes: a process
         # the agent started in a session of its own keeps its parent link only

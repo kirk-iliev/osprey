@@ -25,7 +25,15 @@
 import { pickUiMode } from '/design-system/js/frame-params.js';
 import { uuid4 } from '/design-system/js/uuid.js';
 
-import { answerPermission, fetchCommands, fetchHistory, interrupt, requestHandoff, sendPrompt } from './chat-client.js';
+import {
+  answerPermission,
+  fetchCommands,
+  fetchHistory,
+  followChat,
+  interrupt,
+  requestHandoff,
+  sendPrompt,
+} from './chat-client.js';
 import { createChatRenderer, elem } from './chat-render.js';
 import { chatIcon } from './chat-icons.js';
 import { buildEmptyState, onKindChange, onSettled, renderEmptyStateContent } from './first-contact.js';
@@ -319,6 +327,22 @@ export function initChat(containerId = 'operator-container') {
 
   /** In-flight turn handle, or null when idle. */
   let handle = /** @type {import('./chat-client.js').ChatAbortHandle | null} */ (null);
+
+  /**
+   * The live feed of the bound chat (every tab's view of its agent), or null
+   * while this tab's own turn streams: that turn's stream already carries every
+   * frame the feed would (see {@link pauseFeed}).
+   */
+  let feed = /** @type {import('./chat-client.js').ChatFeed | null} */ (null);
+
+  /**
+   * How the console is following a turn it did not send: `live` saw it start
+   * (another tab's prompt, or the CLI's own response), `joined` came in part-way
+   * (a reload, a second tab opened mid-turn) and re-reads the transcript when
+   * it ends; null when it is not following one.
+   * @type {null | 'live' | 'joined'}
+   */
+  let mirroring = null;
 
   /** Whether a turn is streaming. */
   let streaming = false;
@@ -618,7 +642,7 @@ export function initChat(containerId = 'operator-container') {
    * @param {string} key
    * @returns {Promise<void>}
    */
-  async function bindTo(key) {
+  async function bindTo(key, { keepFeed = false } = {}) {
     boundKey = key;
     resetLog();
     if (isSimpleMode()) notifySessionChange(key);
@@ -629,13 +653,124 @@ export function initChat(containerId = 'operator-container') {
       turns = await fetchHistory(key);
     } catch (err) {
       if (boundKey === key) showNotice(transportNotice(err));
-      return;
     }
     // A newer bind landed while the transcript was in flight; it owns the log.
     if (boundKey !== key) return;
     renderer.replay(turns);
     inviteIfEmpty();
     scrollToBottom();
+    // Follow the agent from here on, so a turn still running — after a reload,
+    // or sent from another tab — keeps drawing.
+    if (!keepFeed) follow(key);
+  }
+
+  /**
+   * Open the live feed for *key*, closing any other.
+   * @param {string} key
+   */
+  function follow(key) {
+    feed?.close();
+    mirroring = null;
+    const mine = followChat(key, {
+      onEvent: (frame) => {
+        // A closed feed can still hand over a frame it had already read.
+        if (feed === mine && boundKey === key) onFeedFrame(frame);
+      },
+    });
+    feed = mine;
+  }
+
+  /**
+   * Close the feed while this tab's own turn streams; the turn's `onClose`
+   * reopens it. The turn's stream carries every frame the feed would, and each
+   * open stream holds one of the six connections a browser gives one host over
+   * HTTP/1.1. The panels keep event streams of their own open, so a seventh
+   * stream leaves every other request the page makes (panel config reads, panel
+   * pages, the gallery's listing) queued until one closes.
+   */
+  function pauseFeed() {
+    feed?.close();
+    feed = null;
+  }
+
+  /** @param {import('./chat-client.js').ChatEvent} event */
+  function draw(event) {
+    // Follow the tail only when the operator hasn't scrolled up to read back.
+    const pinned = isPinned();
+    renderer.handleEvent(event);
+    if (pinned) scrollToBottom();
+  }
+
+  /** @param {import('./chat-client.js').ChatEvent} frame */
+  const endsTurn = (frame) =>
+    frame.type === 'result' ||
+    (frame.type === 'error' && frame.error_type !== 'AssistantMessageError');
+
+  /** Frame types that belong to a response, as opposed to notices about one. */
+  const RESPONSE_FRAMES = new Set([
+    'text',
+    'delta',
+    'thinking',
+    'tool_use',
+    'tool_result',
+    'permission_request',
+  ]);
+
+  /**
+   * One frame from the feed: the snapshot it opens with, then everything the
+   * agent does. The feed is closed while this tab's own turn streams, so what
+   * it brings is a turn sent elsewhere (another tab) or never sent (the CLI
+   * answering a background agent's report).
+   * @param {import('./chat-client.js').ChatEvent} frame
+   */
+  function onFeedFrame(frame) {
+    if (frame.type === 'hello') {
+      if (frame.in_flight && !mirroring) {
+        startMirror('joined', null);
+        for (const pending of frame.pending ?? []) draw(pending);
+      }
+      return;
+    }
+    if (frame.type === 'turn_start') {
+      if (!mirroring) startMirror('live', frame.prompt ?? null);
+      return;
+    }
+    if (!mirroring) {
+      // Part of a response this tab is not drawing yet (its start came before
+      // the feed connected); join it. A notice on its own just draws.
+      if (!RESPONSE_FRAMES.has(frame.type)) {
+        draw(frame);
+        return;
+      }
+      startMirror('joined', null);
+    }
+    draw(frame);
+    if (endsTurn(frame)) endMirror();
+  }
+
+  /**
+   * Start drawing a turn this tab did not send.
+   * @param {'live' | 'joined'} how
+   * @param {string | null} prompt - the operator's prompt, when the turn has one
+   */
+  function startMirror(how, prompt) {
+    mirroring = how;
+    emptyState?.remove();
+    emptyState = null;
+    if (prompt) renderer.addUserMessage(prompt);
+    setStreaming(true);
+    renderer.beginTurn();
+    scrollToBottom();
+  }
+
+  function endMirror() {
+    const joined = mirroring === 'joined';
+    mirroring = null;
+    setStreaming(false);
+    renderer.endTurn();
+    // A turn joined part-way missed what it said before the feed connected;
+    // the transcript has all of it.
+    if (joined) void bindTo(boundKey, { keepFeed: true });
   }
 
   /**
@@ -718,12 +853,10 @@ export function initChat(containerId = 'operator-container') {
     setStreaming(true);
     renderer.beginTurn();
 
+    pauseFeed();
     const current = sendPrompt(boundKey, prompt, {
       onEvent: (event) => {
-        // Follow the tail only when the operator hasn't scrolled up to read back.
-        const pinned = isPinned();
-        renderer.handleEvent(event);
-        if (pinned) scrollToBottom();
+        if (event.type !== 'turn_start') draw(event);
       },
       onError: (err) => {
         const refusal = handoffRefusal(err);
@@ -746,6 +879,7 @@ export function initChat(containerId = 'operator-container') {
         handle = null;
         setStreaming(false);
         renderer.endTurn();
+        follow(boundKey);
       },
     });
     handle = current;
@@ -754,17 +888,19 @@ export function initChat(containerId = 'operator-container') {
   /** Stop the in-flight turn: interrupt server-side first, then abort locally. */
   async function stop() {
     const current = handle;
-    if (!current) return;
+    if (!current && !mirroring) return;
     stopBtn.disabled = true;
     // Interrupt the server turn first, then abort the local fetch. Either
     // arrival order is safe server-side; the abort makes the client stop
     // reading immediately. A failed interrupt still falls through to abort.
+    // A turn this tab is only following has no fetch of its own: the
+    // interrupt's result arrives on the feed and ends it here.
     try {
       await interrupt(boundKey);
     } catch {
       // Non-2xx or network failure — nothing to surface; abort regardless.
     }
-    current.abort();
+    current?.abort();
   }
 
   /**
@@ -780,7 +916,10 @@ export function initChat(containerId = 'operator-container') {
     setPointer(key);
     resetLog();
     inviteIfEmpty();
-    if (isSimpleMode()) notifySessionChange(key);
+    if (isSimpleMode()) {
+      notifySessionChange(key);
+      follow(key);
+    }
   }
 
   textarea.addEventListener('input', autoResize);
@@ -820,6 +959,7 @@ export function initChat(containerId = 'operator-container') {
     else {
       setPointer(boundKey);
       notifySessionChange(boundKey);
+      follow(boundKey);
     }
   }
 }

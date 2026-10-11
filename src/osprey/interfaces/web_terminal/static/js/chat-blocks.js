@@ -46,6 +46,12 @@ export const QUESTION_TOOL_KEY = 'askuserquestion';
  * @property {boolean} pending - awaiting the operator, or mid-delivery
  * @property {() => void} cancel - make inert: the turn ended without an answer
  * @property {() => void} focus - move focus to the card's primary control
+ * @property {(outcome: RemoteAnswer) => void} resolved - another tab answered it
+ */
+
+/**
+ * How a request was answered, as the `permission_resolved` frame reports it.
+ * @typedef {{ allow?: boolean, for_session?: boolean, answers?: Record<string, string> | null }} RemoteAnswer
  */
 
 /**
@@ -60,6 +66,7 @@ export const QUESTION_TOOL_KEY = 'askuserquestion';
  * @typedef {object} ThinkingBlock
  * @property {HTMLElement} el
  * @property {(text: string) => void} add
+ * @property {(text: string) => void} set - replace the reasoning with its final copy
  * @property {() => void} finish
  */
 
@@ -355,6 +362,9 @@ export function createThinkingBlock() {
     el,
     add(text) {
       body.append(text);
+    },
+    set(text) {
+      body.textContent = text;
     },
     finish() {
       el.classList.remove('live');
@@ -712,52 +722,69 @@ async function deliver(hooks, body) {
 }
 
 /**
- * The approval card for a tool call the operator must allow or deny. Enter
- * allows and Escape denies while the card has focus. Once answered it folds to
- * one line stating the outcome.
- * @param {WireEvent} request - a `permission_request` event of kind `tool`
- * @param {CardHooks} hooks
+ * The approval card for a tool call the operator must allow or deny, or — for
+ * kind `plan` — the plan the agent wants to carry out. Enter allows and Escape
+ * denies while the card has focus. Where the request offers it, "Allow for this
+ * session" also lets the tool run without asking until the session ends. Once
+ * answered it folds to one line stating the outcome.
+ * @param {WireEvent} request - a `permission_request` event of kind `tool` or `plan`
+ * @param {CardHooks & { renderText?: (el: HTMLElement, text: string) => void }} hooks
  * @returns {PermissionCard}
  */
 export function createApprovalCard(request, hooks) {
+  const isPlan = request.kind === 'plan';
   const toolName = String(request.tool_name || request.tool_name_raw || 'this tool');
-  const el = elem('section', 'op-card op-approval');
+  const el = elem('section', `op-card op-approval${isPlan ? ' op-plan' : ''}`);
   el.dataset.state = 'pending';
   el.tabIndex = -1;
-  el.setAttribute('aria-label', `Approval needed for ${toolName}`);
+  el.setAttribute('aria-label', isPlan ? 'Plan to approve' : `Approval needed for ${toolName}`);
 
   const head = elem('div', 'op-card-head');
-  const toolIcon = chatIcon(CATEGORY_ICON[toolCategory(request.tool_name_raw ?? request.tool_name)]);
+  const toolIcon = chatIcon(
+    isPlan ? 'read' : CATEGORY_ICON[toolCategory(request.tool_name_raw ?? request.tool_name)],
+  );
   toolIcon.classList.add('op-card-icon');
-  head.append(toolIcon, elem('span', 'op-card-title', `Allow ${toolName}?`));
+  head.append(
+    toolIcon,
+    elem('span', 'op-card-title', isPlan ? 'Ready to start on this plan?' : `Allow ${toolName}?`),
+  );
 
   const body = elem('div', 'op-card-body');
   const reason = typeof request.reason === 'string' ? request.reason.trim() : '';
-  if (reason) body.append(elem('p', 'op-card-reason', reason));
+  if (reason && !isPlan) body.append(elem('p', 'op-card-reason', reason));
 
-  const summary = elem('div', 'op-card-summary');
-  summary.append(elem('code', 'op-card-input', summarizeInput(request.input)));
-  const toggle = button('op-card-toggle', 'Details');
-  toggle.setAttribute('aria-expanded', 'false');
-  summary.append(toggle);
-  const detail = elem('pre', 'op-card-detail', prettyJson(request.input));
-  detail.hidden = true;
-  toggle.addEventListener('click', () => {
-    const open = detail.hidden;
-    detail.hidden = !open;
-    toggle.setAttribute('aria-expanded', String(open));
-    toggle.textContent = open ? 'Hide' : 'Details';
-  });
+  if (isPlan) {
+    const plan = elem('div', 'op-card-plan osprey-md-rendered');
+    const text = String(request.input?.plan ?? '');
+    if (hooks.renderText) hooks.renderText(plan, text);
+    else plan.textContent = text;
+    body.append(plan);
+  } else {
+    const summary = elem('div', 'op-card-summary');
+    summary.append(elem('code', 'op-card-input', summarizeInput(request.input)));
+    const toggle = button('op-card-toggle', 'Details');
+    toggle.setAttribute('aria-expanded', 'false');
+    summary.append(toggle);
+    const detail = elem('pre', 'op-card-detail', prettyJson(request.input));
+    detail.hidden = true;
+    toggle.addEventListener('click', () => {
+      const open = detail.hidden;
+      detail.hidden = !open;
+      toggle.setAttribute('aria-expanded', String(open));
+      toggle.textContent = open ? 'Hide' : 'Details';
+    });
+    body.append(summary, detail);
+  }
 
   const error = elem('p', 'op-card-error');
   error.hidden = true;
-  const deny = button('op-btn', 'Deny');
-  const allow = button('op-btn op-btn-primary', 'Allow');
+  const deny = button('op-btn', isPlan ? 'Keep planning' : 'Deny');
+  const allow = button('op-btn op-btn-primary', isPlan ? 'Approve plan' : 'Allow');
+  const session = request.can_allow_session && !isPlan ? button('op-btn', 'Allow for this session') : null;
   const actions = elem('div', 'op-card-actions');
-  actions.append(deny, allow);
-  body.append(summary, detail, error, actions);
+  actions.append(deny, ...(session ? [session] : []), allow);
+  body.append(error, actions);
   el.append(head, body);
-
   let state = 'pending';
   const isPending = () => state === 'pending' || state === 'sending';
 
@@ -777,30 +804,46 @@ export function createApprovalCard(request, hooks) {
 
   function cancel() {
     if (!isPending()) return;
-    fold('cancelled', 'circle', `Cancelled · ${toolName}`);
+    fold('cancelled', 'circle', `Cancelled · ${isPlan ? 'plan' : toolName}`);
   }
 
-  /** @param {boolean} allowed */
-  async function decide(allowed) {
+  /**
+   * Fold to the outcome line.
+   * @param {boolean} allowed
+   * @param {boolean} forSession
+   */
+  function foldOutcome(allowed, forSession) {
+    if (isPlan) {
+      if (allowed) fold('allowed', 'check', 'Plan approved');
+      else fold('denied', 'x', 'Kept planning');
+    } else if (allowed) {
+      fold('allowed', 'check', `${forSession ? 'Allowed for this session' : 'Allowed'} · ${toolName}`);
+    } else {
+      fold('denied', 'x', `Denied · ${toolName}`);
+    }
+  }
+
+  /**
+   * @param {boolean} allowed
+   * @param {boolean} [forSession]
+   */
+  async function decide(allowed, forSession = false) {
     if (state !== 'pending') return;
     state = 'sending';
     el.dataset.state = 'sending';
-    allow.disabled = true;
-    deny.disabled = true;
+    for (const control of [allow, deny, session]) if (control) control.disabled = true;
     error.hidden = true;
 
-    const outcome = await deliver(hooks, { allow: allowed });
+    const outcome = await deliver(hooks, { allow: allowed, ...(forSession ? { for_session: true } : {}) });
     if (state !== 'sending') return; // the turn ended while the answer was in flight
     if (outcome === 'answered') {
-      if (allowed) fold('allowed', 'check', `Allowed · ${toolName}`);
-      else fold('denied', 'x', `Denied · ${toolName}`);
+      foldOutcome(allowed, forSession);
     } else if (outcome === 'stale') {
       cancel();
     } else {
       state = 'pending';
       el.dataset.state = 'pending';
-      allow.disabled = false;
-      deny.disabled = false;
+      for (const control of [allow, deny, session]) if (control) control.disabled = false;
       error.textContent = 'Could not send that. Try again.';
       error.hidden = false;
     }
@@ -809,6 +852,7 @@ export function createApprovalCard(request, hooks) {
 
   allow.addEventListener('click', () => void decide(true));
   deny.addEventListener('click', () => void decide(false));
+  session?.addEventListener('click', () => void decide(true, true));
   el.addEventListener('keydown', (event) => {
     if (state !== 'pending') return;
     if (event.key === 'Enter') {
@@ -827,6 +871,13 @@ export function createApprovalCard(request, hooks) {
     },
     cancel,
     focus: () => allow.focus(),
+    resolved(answer) {
+      // Answered in another tab; an answer of this tab's own still in flight
+      // folds the card itself.
+      if (state !== 'pending') return;
+      foldOutcome(Boolean(answer.allow), Boolean(answer.for_session));
+      hooks.onSettled();
+    },
   };
 }
 
@@ -1194,6 +1245,13 @@ export function createQuestionCard(request, hooks) {
     },
     cancel,
     focus: () => el.focus(),
+    resolved(answer) {
+      // Answered in another tab; this tab's own answer in flight folds itself.
+      if (state !== 'pending') return;
+      if (answer.allow) fold('answered', 'check', 'Answered in another tab');
+      else fold('skipped', 'x', 'Skipped');
+      hooks.onSettled();
+    },
   };
 }
 
@@ -1249,6 +1307,18 @@ export function createErrorBlock(message) {
 /** @returns {HTMLElement} */
 export function createSessionDivider() {
   return elem('div', 'op-system', 'session reset');
+}
+
+/**
+ * A one-line notice from the CLI in the log, e.g. that the conversation was
+ * compacted. Not a message: it carries no text the agent said.
+ * @param {string} text
+ * @returns {HTMLElement}
+ */
+export function createNotice(text) {
+  const line = elem('div', 'op-notice');
+  line.append(chatIcon('alert'), elem('span', 'op-notice-text', text));
+  return line;
 }
 
 /**

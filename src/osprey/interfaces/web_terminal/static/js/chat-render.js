@@ -30,6 +30,7 @@ import {
   createApprovalCard,
   createErrorBlock,
   createLoader,
+  createNotice,
   createQuestionCard,
   createSessionDivider,
   createTaskCard,
@@ -521,7 +522,15 @@ export function activityLabel(event) {
  * @property {ThinkingBlock | null} thinking - the open thinking block, or null
  * @property {ToolGroup | null} group - the open tool group, or null
  * @property {TaskCard | null} tasks - the turn's one plan card, once it has one
+ * @property {boolean} streamed - the open text block was built from streamed pieces
+ * @property {boolean} thinkingStreamed - the open thinking block was, too
  */
+
+/**
+ * Tools that get no chip: the tool search the CLI runs to load another tool's
+ * schema is bookkeeping, and the plan-mode exit is drawn as its own card.
+ */
+const HIDDEN_TOOL_KEYS = new Set(['toolsearch', 'exitplanmode']);
 
 /**
  * Create a chat renderer bound to a message-list container (the `op-messages`
@@ -612,14 +621,58 @@ export function createChatRenderer(container, options = {}) {
     const entry = createAgentEntry();
     count += 1;
     hasPriorExchange = true;
-    turn = { entry, body: null, texts: [], thinking: null, group: null, tasks: null };
+    turn = {
+      entry,
+      body: null,
+      texts: [],
+      thinking: null,
+      group: null,
+      tasks: null,
+      streamed: false,
+      thinkingStreamed: false,
+    };
     append(entry);
     return turn;
+  }
+
+  /**
+   * Text blocks with a render waiting, coalesced to one render per frame: a
+   * streamed reply re-renders its markdown as it grows, not once per piece.
+   */
+  const pendingRenders = new Map();
+  const nextFrame =
+    typeof requestAnimationFrame === 'function'
+      ? requestAnimationFrame
+      : (/** @type {() => void} */ fn) => setTimeout(fn, 16);
+
+  /**
+   * @param {HTMLElement} body
+   * @param {string} text
+   */
+  function scheduleRender(body, text) {
+    const queued = pendingRenders.has(body);
+    pendingRenders.set(body, text);
+    if (queued) return;
+    nextFrame(() => {
+      const latest = pendingRenders.get(body);
+      pendingRenders.delete(body);
+      if (latest !== undefined) renderMarkdownInto(body, latest, { math: true });
+    });
+  }
+
+  /**
+   * @param {HTMLElement} body
+   * @param {string} text
+   */
+  function renderNow(body, text) {
+    pendingRenders.delete(body);
+    renderMarkdownInto(body, text, { math: true });
   }
 
   /** @param {AgentTurn} t */
   function closeText(t) {
     t.body = null;
+    t.streamed = false;
   }
 
   /** @param {AgentTurn} t */
@@ -627,6 +680,7 @@ export function createChatRenderer(container, options = {}) {
     if (t.thinking) {
       t.thinking.finish();
       t.thinking = null;
+      t.thinkingStreamed = false;
     }
   }
 
@@ -645,25 +699,54 @@ export function createChatRenderer(container, options = {}) {
     closeGroup(t);
   }
 
-  /** @param {string} chunk */
-  function appendText(chunk) {
-    const t = ensureTurn();
+  /**
+   * Open a text block in the turn, or return the one already open.
+   * @param {AgentTurn} t
+   * @returns {HTMLElement}
+   */
+  function openText(t) {
     closeThinking(t);
     closeGroup(t);
-    let body = t.body;
-    if (!body) {
-      body = createTextBlock();
-      t.body = body;
+    if (!t.body) {
+      t.body = createTextBlock();
       t.texts.push('');
-      t.entry.appendChild(body);
+      t.entry.appendChild(t.body);
     }
-    const i = t.texts.length - 1;
-    t.texts[i] += chunk;
-    renderMarkdownInto(body, t.texts[i], { math: true });
+    return t.body;
   }
 
-  /** @param {string} chunk */
-  function appendThinking(chunk) {
+  /**
+   * A whole text block. When the block was streamed it is the authoritative
+   * copy and replaces what the pieces built; either way the block then ends,
+   * so the next one starts a paragraph of its own.
+   * @param {string} chunk
+   */
+  function appendText(chunk) {
+    const t = ensureTurn();
+    const body = openText(t);
+    const i = t.texts.length - 1;
+    t.texts[i] = t.streamed ? chunk : t.texts[i] + chunk;
+    renderNow(body, t.texts[i]);
+    closeText(t);
+  }
+
+  /** @param {string} piece - a streamed piece of the text block being written */
+  function appendTextDelta(piece) {
+    const t = ensureTurn();
+    const body = openText(t);
+    t.streamed = true;
+    const i = t.texts.length - 1;
+    t.texts[i] += piece;
+    scheduleRender(body, t.texts[i]);
+  }
+
+  /**
+   * Reasoning: streamed pieces add up in the block, and the whole block, when
+   * it lands, replaces them.
+   * @param {string} chunk
+   * @param {boolean} [piece] - a streamed piece rather than the whole block
+   */
+  function appendThinking(chunk, piece = false) {
     const t = ensureTurn();
     closeText(t);
     closeGroup(t);
@@ -671,7 +754,14 @@ export function createChatRenderer(container, options = {}) {
       t.thinking = createThinkingBlock();
       t.entry.appendChild(t.thinking.el);
     }
-    t.thinking.add(chunk);
+    if (piece) {
+      t.thinkingStreamed = true;
+      t.thinking.add(chunk);
+    } else if (t.thinkingStreamed) {
+      if (chunk) t.thinking.set(chunk);
+    } else {
+      t.thinking.add(chunk);
+    }
   }
 
   /** @param {Record<string, any>} event - a `tool_use` event */
@@ -720,6 +810,8 @@ export function createChatRenderer(container, options = {}) {
     const hooks = {
       answer: (/** @type {PermissionBody} */ body) => answer(id, body),
       onSettled: () => syncLoader(),
+      renderText: (/** @type {HTMLElement} */ el, /** @type {string} */ text) =>
+        renderMarkdownInto(el, text, { math: true }),
     };
     const card =
       request.kind === 'question'
@@ -870,6 +962,20 @@ export function createChatRenderer(container, options = {}) {
         appendText(event.content ?? '');
         break;
       }
+      case 'delta': {
+        // A streamed piece of the main agent's reply or reasoning; a
+        // subagent's pieces are not drawn — its chip gets each whole block.
+        if (event.parent_tool_use_id) break;
+        if (event.kind === 'thinking') {
+          streamingText = false;
+          activity = 'Thinking…';
+          appendThinking(event.content ?? '', true);
+        } else {
+          streamingText = true;
+          appendTextDelta(event.content ?? '');
+        }
+        break;
+      }
       case 'thinking':
         // A subagent's reasoning stays inside it; its chip shows its work.
         if (ownerOf(event).nested) break;
@@ -891,7 +997,7 @@ export function createChatRenderer(container, options = {}) {
         const key = toolKey(event.tool_name_raw ?? event.tool_name);
         activity = key === QUESTION_TOOL_KEY ? 'Preparing a question…' : activityLabel(event);
         if (key === PLAN_TOOL_KEY) upsertPlan(event);
-        else if (key !== QUESTION_TOOL_KEY) appendToolUse(event);
+        else if (key !== QUESTION_TOOL_KEY && !HIDDEN_TOOL_KEYS.has(key)) appendToolUse(event);
         break;
       }
       case 'tool_result':
@@ -901,6 +1007,11 @@ export function createChatRenderer(container, options = {}) {
       case 'permission_request':
         streamingText = false;
         appendPermission(event);
+        break;
+      case 'permission_resolved':
+        // Answered somewhere — another tab, or this one; a card still waiting
+        // here settles to the same outcome.
+        cards.get(String(event.request_id ?? ''))?.resolved(event);
         break;
       case 'result':
         // Turn boundary. A result finalises the turn and earns the footer; it
@@ -947,6 +1058,29 @@ export function createChatRenderer(container, options = {}) {
             summary: event.summary,
             is_error: event.status === 'failed',
           });
+        } else if (event.subtype === 'compact_boundary') {
+          const tokens =
+            typeof event.pre_tokens === 'number'
+              ? ` · ${Math.round(event.pre_tokens / 1000)}k tokens summarized`
+              : '';
+          const how = event.trigger === 'auto' ? ' automatically' : '';
+          const notice = createNotice(`Conversation compacted${how}${tokens}`);
+          if (turn) {
+            closeText(turn);
+            turn.entry.appendChild(notice);
+          } else {
+            append(notice);
+          }
+        } else if (event.subtype === 'status') {
+          if (event.status === 'compacting') {
+            streamingText = false;
+            activity = 'Compacting the conversation…';
+          }
+        } else if (event.subtype === 'api_retry') {
+          streamingText = false;
+          const code = event.error_status ? ` (${event.error_status})` : '';
+          const of = event.max_retries ? `/${event.max_retries}` : '';
+          activity = `Request failed${code} — retrying, attempt ${event.attempt ?? '?'}${of}…`;
         }
         break;
       default:

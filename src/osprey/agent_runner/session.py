@@ -373,6 +373,7 @@ async def agent_session(
     pre_tool_use_hooks: Sequence[HookCallback] = (),
     stderr: Callable[[str], None] | None = None,
     await_mcp_servers: Collection[str] | None = None,
+    include_partial_messages: bool = False,
 ) -> AsyncIterator[AgentSession]:
     """Open a multi-turn :class:`AgentSession` for *project_dir*.
 
@@ -394,6 +395,8 @@ async def agent_session(
             read-only run; ``None`` when an approval callback mediates).
         await_mcp_servers: The MCP servers to wait for before the first turn;
             ``None`` for the project's declared ones, empty to skip the wait.
+        include_partial_messages: Stream text and reasoning deltas ahead of
+            each whole block.
 
     Yields:
         An :class:`AgentSession` ready to :meth:`~AgentSession.send` turns.
@@ -425,6 +428,7 @@ async def agent_session(
         can_use_tool=can_use_tool,
         pre_tool_use_hooks=pre_tool_use_hooks,
         stderr=stderr,
+        include_partial_messages=include_partial_messages,
     )
 
     async with ClaudeSDKClient(options=options) as client:

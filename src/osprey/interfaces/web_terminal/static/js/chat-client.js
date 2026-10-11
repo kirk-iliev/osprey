@@ -106,14 +106,15 @@ function dispatch(callbacks, event) {
 
 /**
  * Read the response body to completion, decoding and dispatching each SSE
- * frame. Returns once the stream ends or a terminal event is seen. Partial
- * chunks are buffered across reads so a frame split mid-transfer is delivered
- * exactly once and whole.
+ * frame. Returns once the stream ends or — unless *untilClosed* — a terminal
+ * event is seen. Partial chunks are buffered across reads so a frame split
+ * mid-transfer is delivered exactly once and whole.
  * @param {ReadableStreamDefaultReader<Uint8Array>} reader
  * @param {ChatCallbacks} callbacks
+ * @param {boolean} [untilClosed] - keep reading past terminal events (a live feed)
  * @returns {Promise<void>}
  */
-async function pump(reader, callbacks) {
+async function pump(reader, callbacks, untilClosed = false) {
   const decoder = new TextDecoder();
   let buffer = '';
   while (true) {
@@ -127,7 +128,7 @@ async function pump(reader, callbacks) {
       const event = parseSseFrame(frame);
       if (!event) continue;
       dispatch(callbacks, event);
-      if (isTerminal(event)) return;
+      if (!untilClosed && isTerminal(event)) return;
     }
   }
   // Flush a trailing frame that arrived without its closing blank line.
@@ -282,10 +283,12 @@ export async function interrupt(chatId) {
 /**
  * Answer the `permission_request` a turn is waiting on. The body carries the
  * request id, the decision and — for a question — the chosen answers keyed by
- * question text. A 404 `no_pending_request` means the request is already gone:
- * the turn was stopped, or another tab answered it first.
+ * question text; `for_session` also allows the tool for the rest of the
+ * session where the request offered that. A 404 `no_pending_request` means
+ * the request is already gone: the turn was stopped, or another tab answered
+ * it first.
  * @param {string} chatId
- * @param {{ request_id: string, allow: boolean, answers?: Record<string, string>, message?: string }} body
+ * @param {{ request_id: string, allow: boolean, answers?: Record<string, string>, message?: string, for_session?: boolean }} body
  * @returns {Promise<Response>}
  */
 export async function answerPermission(chatId, body) {
@@ -296,6 +299,75 @@ export async function answerPermission(chatId, body) {
   });
   if (!res.ok) throw await transportError(res);
   return res;
+}
+
+/**
+ * A live feed held open by {@link followChat}.
+ * @typedef {object} ChatFeed
+ * @property {() => void} close - stop following for good
+ */
+
+/**
+ * Follow everything the agent behind *chatId* does, whichever tab asked, until
+ * closed: `GET /api/chat/{chat_id}/events`. Each (re)connect opens with a
+ * `hello` snapshot. A dropped connection is retried with backoff; a 404 (no
+ * agent runs for the chat yet) more slowly.
+ * @param {string} chatId
+ * @param {ChatCallbacks} callbacks - `onEvent` gets every frame
+ * @returns {ChatFeed}
+ */
+export function followChat(chatId, callbacks) {
+  let closed = false;
+  let generation = 0;
+  let delay = 1000;
+  let timer = /** @type {ReturnType<typeof setTimeout> | null} */ (null);
+  let controller = /** @type {AbortController | null} */ (null);
+
+  /** @param {number} ms */
+  function retry(ms) {
+    if (closed) return;
+    clearTimeout(timer ?? undefined);
+    timer = setTimeout(() => void connect(), ms);
+  }
+
+  async function connect() {
+    if (closed) return;
+    const mine = ++generation;
+    // A reconnect supersedes any retry still waiting to fire.
+    clearTimeout(timer ?? undefined);
+    timer = null;
+    controller?.abort();
+    controller = new AbortController();
+    let next = delay;
+    try {
+      const res = await fetch(
+        withPrefix(`${CHAT_ENDPOINT}/${encodeURIComponent(chatId)}/events`),
+        { signal: controller.signal, cache: 'no-store' },
+      );
+      if (res.ok && res.body) {
+        delay = 1000;
+        await pump(res.body.getReader(), callbacks, true);
+        next = delay;
+      } else if (res.status === 404) {
+        next = 10000;
+      }
+    } catch {
+      /* dropped or aborted — retried below unless superseded or closed */
+    }
+    if (mine !== generation) return;
+    delay = Math.min(delay * 2, 10000);
+    retry(next);
+  }
+
+  void connect();
+  return {
+    close() {
+      closed = true;
+      generation += 1;
+      clearTimeout(timer ?? undefined);
+      controller?.abort();
+    },
+  };
 }
 
 /**
